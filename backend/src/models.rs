@@ -195,7 +195,12 @@ pub struct JmaEew {
     pub is_final: bool,
     #[serde(rename = "Cancel", alias = "isCancel", default)]
     pub cancel: bool,
-    #[serde(rename = "is_training", alias = "Training", default)]
+    #[serde(
+        rename = "isTraining",
+        alias = "is_training",
+        alias = "Training",
+        default
+    )]
     pub training: bool,
 }
 
@@ -219,15 +224,20 @@ pub struct SichuanEew {
     // 上游字段拼写为 Magunitude，反序列化时必须保留这个拼写
     #[serde(rename = "Magunitude")]
     pub magnitude: f64,
-    #[serde(rename = "Depth")]
-    pub depth: f64,
+    #[serde(rename = "Depth", default)]
+    pub depth: Option<f64>,
     #[serde(rename = "MaxIntensity")]
     pub max_intensity: f64,
     #[serde(rename = "isFinal", default)]
     pub is_final: bool,
     #[serde(rename = "Cancel", alias = "isCancel", default)]
     pub cancel: bool,
-    #[serde(rename = "is_training", alias = "Training", default)]
+    #[serde(
+        rename = "isTraining",
+        alias = "is_training",
+        alias = "Training",
+        default
+    )]
     pub training: bool,
 }
 
@@ -250,15 +260,20 @@ pub struct CencEew {
     pub longitude: f64,
     #[serde(rename = "Magnitude")]
     pub magnitude: f64,
-    #[serde(rename = "Depth")]
-    pub depth: f64,
+    #[serde(rename = "Depth", default)]
+    pub depth: Option<f64>,
     #[serde(rename = "MaxIntensity")]
     pub max_intensity: f64,
     #[serde(rename = "isFinal", default)]
     pub is_final: bool,
     #[serde(rename = "Cancel", alias = "isCancel", default)]
     pub cancel: bool,
-    #[serde(rename = "is_training", alias = "Training", default)]
+    #[serde(
+        rename = "isTraining",
+        alias = "is_training",
+        alias = "Training",
+        default
+    )]
     pub training: bool,
 }
 
@@ -284,11 +299,52 @@ pub struct FujianEew {
     pub magnitude: f64,
     #[serde(rename = "Depth", default)]
     pub depth: f64,
-    #[serde(rename = "isFinal")]
+    #[serde(rename = "isFinal", default)]
     pub is_final: bool,
     #[serde(rename = "Cancel", alias = "isCancel", default)]
     pub cancel: bool,
-    #[serde(rename = "is_training", alias = "Training", default)]
+    #[serde(
+        rename = "isTraining",
+        alias = "is_training",
+        alias = "Training",
+        default
+    )]
+    pub training: bool,
+}
+
+/// 重庆市地震局预警数据，字段与 CENC 类似但震级字段为 Magnitude。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ChongqingEew {
+    #[serde(rename = "type")]
+    pub alert_type: String,
+    #[serde(rename = "EventID")]
+    pub event_id: String,
+    #[serde(rename = "ReportNum", alias = "Serial", default)]
+    pub report_num: u32,
+    #[serde(rename = "OriginTime")]
+    pub origin_time: String,
+    #[serde(rename = "HypoCenter")]
+    pub hypocenter: String,
+    #[serde(rename = "Latitude")]
+    pub latitude: f64,
+    #[serde(rename = "Longitude")]
+    pub longitude: f64,
+    #[serde(rename = "Magnitude")]
+    pub magnitude: f64,
+    #[serde(rename = "Depth", default)]
+    pub depth: Option<f64>,
+    #[serde(rename = "MaxIntensity", default)]
+    pub max_intensity: Option<f64>,
+    #[serde(rename = "isFinal", default)]
+    pub is_final: bool,
+    #[serde(rename = "Cancel", alias = "isCancel", default)]
+    pub cancel: bool,
+    #[serde(
+        rename = "isTraining",
+        alias = "is_training",
+        alias = "Training",
+        default
+    )]
     pub training: bool,
 }
 
@@ -306,6 +362,7 @@ pub enum EarthquakeData {
     SichuanEew(SichuanEew),
     CencEew(CencEew),
     FujianEew(FujianEew),
+    ChongqingEew(ChongqingEew),
     Unknown(UnknownEarthquakeData),
 }
 
@@ -329,6 +386,10 @@ impl EarthquakeData {
             "fj_eew" => {
                 let data: FujianEew = serde_json::from_str(json)?;
                 Ok(EarthquakeData::FujianEew(data))
+            }
+            "cq_eew" => {
+                let data: ChongqingEew = serde_json::from_str(json)?;
+                Ok(EarthquakeData::ChongqingEew(data))
             }
             _ => {
                 tracing::warn!(
@@ -375,7 +436,7 @@ impl EarthquakeData {
                 latitude: data.latitude,
                 longitude: data.longitude,
                 magnitude: data.magnitude,
-                depth: data.depth,
+                depth: data.depth.unwrap_or(0.0),
                 max_intensity: data.max_intensity.to_string(),
                 region: data.hypocenter.clone(),
                 origin_time: data.origin_time.clone(),
@@ -390,7 +451,7 @@ impl EarthquakeData {
                 latitude: data.latitude,
                 longitude: data.longitude,
                 magnitude: data.magnitude,
-                depth: data.depth,
+                depth: data.depth.unwrap_or(0.0),
                 max_intensity: data.max_intensity.to_string(),
                 region: data.hypocenter.clone(),
                 origin_time: data.origin_time.clone(),
@@ -410,6 +471,24 @@ impl EarthquakeData {
                 region: data.hypocenter.clone(),
                 origin_time: data.origin_time.clone(),
                 source_type: "fj_eew".to_string(),
+            }),
+            EarthquakeData::ChongqingEew(data) => Some(CommonEarthquakeInfo {
+                event_id: data.event_id.clone(),
+                report_num: data.report_num,
+                final_report: data.is_final,
+                cancel: data.cancel,
+                training: data.training,
+                latitude: data.latitude,
+                longitude: data.longitude,
+                magnitude: data.magnitude,
+                depth: data.depth.unwrap_or(0.0),
+                max_intensity: data
+                    .max_intensity
+                    .map(|value| value.to_string())
+                    .unwrap_or_else(|| "未知".to_string()),
+                region: data.hypocenter.clone(),
+                origin_time: data.origin_time.clone(),
+                source_type: "cq_eew".to_string(),
             }),
             EarthquakeData::Unknown(data) => {
                 // fallback 只接受推送所需的最小字段集合，避免误推结构不明确的数据
@@ -456,7 +535,7 @@ impl EarthquakeData {
                 let report_num = json_u32(&data.data, &["ReportNum", "Serial"]);
                 let final_report = json_bool(&data.data, &["isFinal", "Final"]);
                 let cancel = json_bool(&data.data, &["Cancel", "isCancel"]);
-                let training = json_bool(&data.data, &["is_training", "Training"]);
+                let training = json_bool(&data.data, &["isTraining", "is_training", "Training"]);
 
                 tracing::info!(
                     event = "eew.unknown_source_normalized",
@@ -587,6 +666,76 @@ impl Default for GeoHashIndex {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn parses_all_documented_wolfx_eew_sources() {
+        let cases = [
+            (
+                r#"{"type":"jma_eew","EventID":"jma-1","Serial":6,"AnnouncedTime":"2026/07/10 01:22:52","OriginTime":"2026/07/10 01:21:43","Hypocenter":"宮古島北西沖","Latitude":25.5,"Longitude":125.0,"Magunitude":4.4,"Depth":100,"MaxIntensity":"2","isTraining":true,"isFinal":true,"isCancel":true}"#,
+                "jma_eew",
+                6,
+                100.0,
+            ),
+            (
+                r#"{"type":"sc_eew","EventID":"sc-1","ReportNum":1,"OriginTime":"2026-07-09 07:44:12","HypoCenter":"四川宜宾市高县","Latitude":28.509,"Longitude":104.687,"Magunitude":5.1,"Depth":null,"MaxIntensity":7.1}"#,
+                "sc_eew",
+                1,
+                0.0,
+            ),
+            (
+                r#"{"type":"cenc_eew","EventID":"cenc-1","ReportNum":2,"OriginTime":"2026-07-09 07:44:12","HypoCenter":"四川宜宾市高县","Latitude":28.509,"Longitude":104.687,"Magnitude":5.1,"Depth":null,"MaxIntensity":7.1}"#,
+                "cenc_eew",
+                2,
+                0.0,
+            ),
+            (
+                r#"{"type":"fj_eew","EventID":"fj-1","ReportNum":1,"OriginTime":"2026-05-14 04:45:25","HypoCenter":"江西赣州市寻乌县","Latitude":25.0,"Longitude":115.69,"Magunitude":3.4}"#,
+                "fj_eew",
+                1,
+                0.0,
+            ),
+            (
+                r#"{"type":"cq_eew","EventID":"cq-1","ReportNum":3,"OriginTime":"2026-07-09 07:44:12","HypoCenter":"四川宜宾市高县","Latitude":28.509,"Longitude":104.687,"Magnitude":5.1,"Depth":null,"MaxIntensity":7.1}"#,
+                "cq_eew",
+                3,
+                0.0,
+            ),
+        ];
+
+        for (json, source_type, report_num, depth) in cases {
+            let parsed = EarthquakeData::parse_to_common_info(json);
+            assert!(parsed.is_ok(), "failed to parse {source_type}: {parsed:?}");
+            if let Ok(info) = parsed {
+                assert_eq!(info.source_type, source_type);
+                assert_eq!(info.report_num, report_num);
+                assert_eq!(info.depth, depth);
+            }
+        }
+
+        let parsed = EarthquakeData::parse_to_common_info(cases[0].0);
+        assert!(parsed.is_ok(), "failed to parse JMA flags: {parsed:?}");
+        if let Ok(jma) = parsed {
+            assert!(jma.training);
+            assert!(jma.final_report);
+            assert!(jma.cancel);
+        }
+    }
+
+    #[test]
+    fn normalizes_future_eew_sources_with_documented_field_shapes() {
+        let parsed = EarthquakeData::parse_to_common_info(
+            r#"{"type":"future_eew","EventID":"future-1","ReportNum":"4","OriginTime":"2026-07-10 01:21:43","HypoCenter":"测试震源","Latitude":"25.5","Longitude":"125.0","Magnitude":"4.4","Depth":null,"MaxIntensity":3,"isTraining":true}"#,
+        );
+
+        assert!(parsed.is_ok(), "failed to parse future source: {parsed:?}");
+        if let Ok(info) = parsed {
+            assert_eq!(info.source_type, "future_eew");
+            assert_eq!(info.report_num, 4);
+            assert_eq!(info.depth, 0.0);
+            assert_eq!(info.max_intensity, "3");
+            assert!(info.training);
+        }
+    }
 
     #[test]
     fn level_for_intensity_uses_lowest_matching_band_min() {

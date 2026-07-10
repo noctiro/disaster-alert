@@ -6,7 +6,7 @@ use crate::models::{
 use crate::services::{AlertRecipient, AlertTiming, BarkNotifier};
 use crate::utils::{distance, geohash, intensity};
 use anyhow::Result;
-use futures_util::{StreamExt, stream};
+use futures_util::{SinkExt, StreamExt, stream};
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -145,12 +145,21 @@ impl EarthquakeMonitor {
             "websocket.connected"
         );
 
-        // tokio-tungstenite automatically queues Pong responses while reading Ping frames.
-        let (_write, mut read) = ws_stream.split();
+        // tokio-tungstenite handles WebSocket Ping frames. Wolfx additionally recommends
+        // replying to its JSON heartbeat with the text command "ping".
+        let (mut write, mut read) = ws_stream.split();
 
         while let Some(message) = read.next().await {
             match message {
                 Ok(Message::Text(text)) => {
+                    if is_wolfx_heartbeat(&text) {
+                        write.send(Message::Text("ping".into())).await?;
+                        tracing::debug!(
+                            event = "websocket.heartbeat_ping_sent",
+                            "websocket.heartbeat_ping_sent"
+                        );
+                        continue;
+                    }
                     if let Err(e) = self.handle_earthquake_message(&text).await {
                         tracing::error!(event = "eew.handle_failed", error = ?e, "eew.handle_failed");
                     }
@@ -481,6 +490,12 @@ impl EarthquakeMonitor {
     }
 }
 
+fn is_wolfx_heartbeat(message: &str) -> bool {
+    serde_json::from_str::<WebSocketMessage>(message)
+        .map(|message| message.message_type == "heartbeat")
+        .unwrap_or(false)
+}
+
 fn evaluate_subscription(
     config: &MonitorConfig,
     subscription: &Subscription,
@@ -675,5 +690,12 @@ mod tests {
             None
         );
         assert!(parse_datetime_epoch_seconds("2024-02-29 09:30:00", 8 * 3600).is_some());
+    }
+
+    #[test]
+    fn identifies_only_wolfx_json_heartbeats() {
+        assert!(is_wolfx_heartbeat(r#"{"type":"heartbeat","ver":1}"#));
+        assert!(!is_wolfx_heartbeat(r#"{"type":"jma_eew"}"#));
+        assert!(!is_wolfx_heartbeat("heartbeat"));
     }
 }

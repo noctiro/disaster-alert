@@ -71,11 +71,39 @@ impl Subscription {
         locations
     }
 
-    pub fn level_for_intensity(&self, estimated_intensity: u8) -> Option<String> {
+    pub fn for_each_normalized_location<F>(&self, mut visitor: F)
+    where
+        F: FnMut(&str, f64, f64),
+    {
+        let mut found = false;
+        for location in self
+            .locations
+            .iter()
+            .filter(|location| valid_coordinate(location.latitude, location.longitude))
+            .take(3)
+        {
+            found = true;
+            visitor(&location.name, location.latitude, location.longitude);
+        }
+        if !found && valid_coordinate(self.latitude, self.longitude) {
+            visitor(&self.location_name, self.latitude, self.longitude);
+        }
+    }
+
+    pub fn normalize_for_storage(&mut self) -> Result<(), String> {
+        for band in &mut self.notify_bands {
+            band.level = normalize_bark_level(&band.level);
+            if !validate_bark_level(&band.level) {
+                return Err("通知级别必须是 passive、active 或 critical".to_string());
+            }
+        }
+        Ok(())
+    }
+
+    pub fn level_for_intensity(&self, estimated_intensity: u8) -> Option<&str> {
         let mut selected: Option<&NotificationBand> = None;
         for band in &self.notify_bands {
-            let normalized = normalize_bark_level(&band.level);
-            if validate_bark_level(&normalized)
+            if validate_bark_level(&band.level)
                 && estimated_intensity >= band.min
                 && estimated_intensity <= band.max
                 && selected
@@ -85,8 +113,12 @@ impl Subscription {
                 selected = Some(band);
             }
         }
-        selected.map(|band| normalize_bark_level(&band.level))
+        selected.map(|band| band.level.as_str())
     }
+}
+
+pub fn normalize_bark_level(level: &str) -> String {
+    level.trim().to_ascii_lowercase()
 }
 
 #[derive(Debug, Deserialize)]
@@ -111,10 +143,6 @@ pub struct UnsubscribeRequest {
 
 pub fn validate_bark_level(level: &str) -> bool {
     matches!(level, "passive" | "active" | "critical")
-}
-
-pub fn normalize_bark_level(level: &str) -> String {
-    level.trim().to_ascii_lowercase()
 }
 
 pub fn valid_coordinate(lat: f64, lon: f64) -> bool {
@@ -640,29 +668,6 @@ pub struct WebSocketMessage {
     pub message_type: String,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct GeoHashIndex {
-    pub bark_ids: Vec<String>,
-}
-
-impl GeoHashIndex {
-    pub fn new() -> Self {
-        Self {
-            bark_ids: Vec::new(),
-        }
-    }
-
-    pub fn remove(&mut self, bark_id: &str) {
-        self.bark_ids.retain(|id| id != bark_id);
-    }
-}
-
-impl Default for GeoHashIndex {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -755,9 +760,6 @@ mod tests {
             },
         ];
 
-        assert_eq!(
-            subscription.level_for_intensity(5).as_deref(),
-            Some("active")
-        );
+        assert_eq!(subscription.level_for_intensity(5), Some("active"));
     }
 }

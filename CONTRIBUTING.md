@@ -4,7 +4,7 @@
 
 ## 改动边界
 
-- `backend/` 是核心后端：订阅 API、Wolfx WebSocket、GeoHash 匹配、Bark 推送和内嵌前端
+- `backend/` 是核心后端：订阅 API、Wolfx WebSocket、订阅匹配、Bark 推送和内嵌前端
 - `web/index.html` 是唯一前端源文件，后端通过 `include_str!` 内嵌它
 - `deploy/` 只放部署适配器，不承载地震监听、订阅存储或推送逻辑
 
@@ -57,7 +57,6 @@ cargo test
 tracing::info!(
     event = "subscription.stored",
     bark_id = %mask_bark_id(&bark_id),
-    geohash_count = new_geohashes.len(),
     "subscription.stored"
 );
 ```
@@ -78,7 +77,7 @@ tracing::info!(
 - 只允许通过 `POST /api/subscribe` 创建或覆盖订阅，通过 `DELETE /api/unsubscribe` 删除订阅
 - 不提供「输入 Bark ID 查询订阅详情」的接口，Bark ID 不能作为反查用户位置、地点名称、通知级别或订阅时间的凭据
 - 退订接口只返回操作结果，不回显订阅内容
-- 统计接口只返回聚合数量，不返回 Bark ID、GeoHash、位置或通知规则
+- 统计接口只返回聚合数量，不返回 Bark ID、位置或通知规则
 - 日志中只输出 `mask_bark_id` 处理后的 Bark ID，不输出完整 Bark ID、精确位置和原始订阅请求体
 - 示例、测试、截图和 issue 不使用真实 Bark ID 或真实用户位置
 - 不提交真实 `.env`、数据库文件、Bark key、访问 token 或生产私密配置

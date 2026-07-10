@@ -1,4 +1,4 @@
-use crate::db::SubscriptionStore;
+use crate::db::{SubscriptionSnapshot, SubscriptionStore};
 use crate::models::{CommonEarthquakeInfo, Subscription, mask_bark_id};
 use anyhow::{Context, Result};
 use serde::Deserialize;
@@ -94,6 +94,10 @@ impl BarkNotifier {
 
     pub fn allows_bark_url(&self, bark_url: &str) -> bool {
         self.allowed_urls.contains(bark_url)
+    }
+
+    pub fn is_subscription_current(&self, subscription: &SubscriptionSnapshot) -> bool {
+        self.subscription_store.is_current(subscription)
     }
 
     pub async fn send_earthquake_alert(

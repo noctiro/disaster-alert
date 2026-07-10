@@ -1,13 +1,35 @@
-use crate::models::{GeoHashIndex, Subscription, mask_bark_id};
-use crate::utils::geohash;
-use anyhow::{Context, Result, anyhow};
+use crate::models::{Subscription, mask_bark_id};
+use anyhow::{Result, anyhow};
 use sled::Db;
-use sled::transaction::{ConflictableTransactionError, TransactionError, TransactionalTree};
-use std::collections::HashSet;
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex, MutexGuard, RwLock, RwLockReadGuard, RwLockWriteGuard};
 
 #[derive(Clone)]
 pub struct SubscriptionStore {
     db: Db,
+    cache: Arc<RwLock<SubscriptionCache>>,
+    write_gate: Arc<Mutex<()>>,
+}
+
+#[derive(Clone)]
+pub struct SubscriptionSnapshot {
+    pub subscription: Arc<Subscription>,
+    version: Arc<Subscription>,
+}
+
+impl SubscriptionSnapshot {
+    pub(crate) fn new(subscription: Arc<Subscription>) -> Self {
+        Self {
+            version: Arc::clone(&subscription),
+            subscription,
+        }
+    }
+}
+
+struct SubscriptionCache {
+    by_bark_id: HashMap<String, Arc<Subscription>>,
+    snapshot: Arc<Vec<Arc<Subscription>>>,
+    snapshot_dirty: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -17,43 +39,68 @@ pub enum StoreErrorKind {
 }
 
 impl SubscriptionStore {
-    pub fn new(db: Db) -> Self {
-        Self { db }
+    pub(crate) fn new(db: Db) -> Result<Self> {
+        let mut subscriptions = HashMap::new();
+        for item in db.scan_prefix(b"sub:") {
+            let (key, value) = item?;
+            match serde_json::from_slice::<Subscription>(&value) {
+                Ok(mut subscription) if subscription_key_matches(&key, &subscription.bark_id) => {
+                    subscription.normalize_for_storage().map_err(|error| {
+                        anyhow!(
+                            "invalid subscription record {}: {error}",
+                            mask_subscription_key(&key)
+                        )
+                    })?;
+                    subscriptions.insert(subscription.bark_id.clone(), Arc::new(subscription));
+                }
+                Ok(_subscription) => {
+                    anyhow::bail!(
+                        "subscription record key mismatch: {}",
+                        mask_subscription_key(&key)
+                    );
+                }
+                Err(error) => {
+                    return Err(anyhow!(
+                        "invalid subscription record {}: {error}",
+                        mask_subscription_key(&key)
+                    ));
+                }
+            }
+        }
+        let snapshot = Arc::new(subscriptions.values().cloned().collect());
+        Ok(Self {
+            db,
+            cache: Arc::new(RwLock::new(SubscriptionCache {
+                by_bark_id: subscriptions,
+                snapshot,
+                snapshot_dirty: false,
+            })),
+            write_gate: Arc::new(Mutex::new(())),
+        })
     }
 
-    pub fn upsert_subscription(&self, subscription: Subscription) -> Result<()> {
+    pub fn upsert_subscription(&self, mut subscription: Subscription) -> Result<()> {
+        subscription
+            .normalize_for_storage()
+            .map_err(|error| anyhow!("invalid subscription: {error}"))?;
         let bark_id = subscription.bark_id.clone();
-        let new_geohashes = subscription_geohashes(&subscription);
-
-        let old_subscription = self.get_subscription_optional(&bark_id)?;
-        let is_new_subscription = old_subscription.is_none();
-
-        let old_geohashes = old_subscription
-            .as_ref()
-            .map(subscription_geohashes)
-            .unwrap_or_default();
         let primary_key = format!("sub:{}", bark_id);
         let primary_value = serde_json::to_vec(&subscription)?;
-
-        run_transaction(self.db.transaction(|tx| {
-            for geohash_str in &old_geohashes {
-                remove_from_geohash_index_tx(tx, &bark_id, geohash_str)?;
-            }
-            for geohash_str in old_geohashes.difference(&new_geohashes) {
-                remove_from_geohash_subscription_tx(tx, &bark_id, geohash_str)?;
-            }
-            tx.insert(primary_key.as_bytes(), primary_value.clone())?;
-            for geohash_str in &new_geohashes {
-                insert_geohash_subscription_tx(tx, &bark_id, geohash_str, primary_value.clone())?;
-            }
-            Ok(())
-        }))?;
+        let _write_guard = self.lock_write_gate();
+        let is_new_subscription = self
+            .db
+            .insert(primary_key.as_bytes(), primary_value)?
+            .is_none();
+        let mut cache = self.write_cache();
+        cache
+            .by_bark_id
+            .insert(bark_id.clone(), Arc::new(subscription));
+        cache.snapshot_dirty = true;
 
         tracing::info!(
             event = "subscription.stored",
             action = if is_new_subscription { "insert" } else { "update" },
             bark_id = %mask_bark_id(&bark_id),
-            geohash_count = new_geohashes.len(),
             "subscription.stored"
         );
 
@@ -61,18 +108,14 @@ impl SubscriptionStore {
     }
 
     pub fn delete_subscription(&self, bark_id: &str) -> Result<()> {
-        let subscription = self.get_subscription(bark_id)?;
-        let geohashes = subscription_geohashes(&subscription);
         let primary_key = format!("sub:{}", bark_id);
-
-        run_transaction(self.db.transaction(|tx| {
-            for geohash_str in &geohashes {
-                remove_from_geohash_index_tx(tx, bark_id, geohash_str)?;
-                remove_from_geohash_subscription_tx(tx, bark_id, geohash_str)?;
-            }
-            tx.remove(primary_key.as_bytes())?;
-            Ok(())
-        }))?;
+        let _write_guard = self.lock_write_gate();
+        if self.db.remove(primary_key.as_bytes())?.is_none() {
+            return Err(anyhow!("订阅不存在"));
+        }
+        let mut cache = self.write_cache();
+        cache.by_bark_id.remove(bark_id);
+        cache.snapshot_dirty = true;
 
         tracing::info!(
             event = "subscription.deleted",
@@ -80,11 +123,6 @@ impl SubscriptionStore {
             "subscription.deleted"
         );
         Ok(())
-    }
-
-    pub fn get_subscription(&self, bark_id: &str) -> Result<Subscription> {
-        self.get_subscription_optional(bark_id)?
-            .ok_or_else(|| anyhow!("订阅不存在"))
     }
 
     pub fn classify_error(error: &anyhow::Error) -> StoreErrorKind {
@@ -95,194 +133,112 @@ impl SubscriptionStore {
         }
     }
 
-    fn get_subscription_optional(&self, bark_id: &str) -> Result<Option<Subscription>> {
-        let key = format!("sub:{}", bark_id);
-        let Some(value) = self.db.get(key.as_bytes())? else {
-            return Ok(None);
-        };
-
-        let subscription: Subscription = serde_json::from_slice(&value)
-            .with_context(|| format!("订阅数据格式错误: {}", mask_bark_id(bark_id)))?;
-        Ok(Some(subscription))
-    }
-
-    /// 按 geohash 集合返回匹配的订阅。
-    ///
-    /// 热路径使用 `geo_sub:{geohash}:{bark_id}` 桶化索引，通知时只扫描目标
-    /// geohash 的连续 key range，避免先读 `geo:` ID 列表再对每个 bark_id 做
-    /// 一次随机 `get`。旧版 `geo:` 索引作为兼容 fallback 保留。
-    pub fn for_each_subscription_by_geohashes<F>(
-        &self,
-        geohashes: &[String],
-        mut visitor: F,
-    ) -> Result<()>
+    pub fn for_each_subscription<F>(&self, mut visitor: F) -> Result<()>
     where
-        F: FnMut(Subscription) -> Result<()>,
+        F: FnMut(SubscriptionSnapshot) -> Result<()>,
     {
-        if geohashes.is_empty() {
-            return Ok(());
-        }
-
-        let mut seen_bark_ids = HashSet::new();
-        let mut fallback_bark_ids = Vec::new();
-
-        for geohash in geohashes {
-            let prefix = format!("geo_sub:{geohash}:");
-            for item in self.db.scan_prefix(prefix.as_bytes()) {
-                let (_key, value) = item?;
-                let subscription: Subscription = serde_json::from_slice(&value)
-                    .with_context(|| format!("GeoHash 订阅桶数据格式错误: {geohash}"))?;
-                if seen_bark_ids.insert(subscription.bark_id.clone()) {
-                    visitor(subscription)?;
+        let snapshot = {
+            let cache = self.read_cache();
+            if !cache.snapshot_dirty {
+                cache.snapshot.clone()
+            } else {
+                drop(cache);
+                let mut cache = self.write_cache();
+                if cache.snapshot_dirty {
+                    cache.snapshot = Arc::new(cache.by_bark_id.values().cloned().collect());
+                    cache.snapshot_dirty = false;
                 }
+                cache.snapshot.clone()
             }
-
-            if let Some(index) = self.get_geohash_index_optional(geohash)? {
-                fallback_bark_ids.extend(index.bark_ids);
-            }
+        };
+        for subscription in snapshot.iter() {
+            visitor(SubscriptionSnapshot::new(Arc::clone(subscription)))?;
         }
-
-        fallback_bark_ids.sort();
-        fallback_bark_ids.dedup();
-
-        for bark_id in fallback_bark_ids {
-            if !seen_bark_ids.insert(bark_id.clone()) {
-                continue;
-            }
-            match self.get_subscription_optional(&bark_id)? {
-                Some(subscription) => visitor(subscription)?,
-                None => tracing::warn!(
-                    event = "subscription.index_dangling",
-                    bark_id = %mask_bark_id(&bark_id),
-                    "subscription.index_dangling"
-                ),
-            }
-        }
-
         Ok(())
     }
 
     pub fn get_total_count(&self) -> Result<usize> {
-        let mut count = 0usize;
-        for item in self.db.scan_prefix(b"sub:") {
-            let (_key, _value) = item?;
-            count += 1;
-        }
-        Ok(count)
+        Ok(self.read_cache().by_bark_id.len())
     }
 
-    fn get_geohash_index_optional(&self, geohash: &str) -> Result<Option<GeoHashIndex>> {
-        let key = format!("geo:{geohash}");
-        let Some(value) = self.db.get(key.as_bytes())? else {
-            return Ok(None);
-        };
-
-        let index: GeoHashIndex = serde_json::from_slice(&value)
-            .with_context(|| format!("GeoHash 索引数据格式错误: {geohash}"))?;
-        Ok(Some(index))
-    }
-}
-
-#[derive(Debug, Clone)]
-enum TxError {
-    Serde(String),
-}
-
-impl std::fmt::Display for TxError {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            TxError::Serde(message) => write!(formatter, "事务序列化失败: {message}"),
+    fn lock_write_gate(&self) -> MutexGuard<'_, ()> {
+        match self.write_gate.lock() {
+            Ok(guard) => guard,
+            Err(error) => {
+                tracing::error!(
+                    event = "subscription.write_lock_recovered",
+                    "subscription.write_lock_recovered"
+                );
+                error.into_inner()
+            }
         }
     }
-}
 
-fn run_transaction(result: std::result::Result<(), TransactionError<TxError>>) -> Result<()> {
-    result.map_err(|error| match error {
-        TransactionError::Abort(error) => anyhow!("{error}"),
-        TransactionError::Storage(error) => {
-            anyhow::Error::new(error).context("storage transaction failed")
+    fn read_cache(&self) -> RwLockReadGuard<'_, SubscriptionCache> {
+        match self.cache.read() {
+            Ok(guard) => guard,
+            Err(error) => {
+                tracing::error!(
+                    event = "subscription.cache_lock_recovered",
+                    "subscription.cache_lock_recovered"
+                );
+                error.into_inner()
+            }
         }
-    })
-}
-
-fn remove_from_geohash_index_tx(
-    tx: &TransactionalTree,
-    bark_id: &str,
-    geohash: &str,
-) -> std::result::Result<(), ConflictableTransactionError<TxError>> {
-    let key = format!("geo:{geohash}");
-    let Some(mut index) = geohash_index_from_tx(tx, &key, geohash)? else {
-        return Ok(());
-    };
-    index.remove(bark_id);
-    if index.bark_ids.is_empty() {
-        tx.remove(key.as_bytes())?;
-    } else {
-        let value = serde_json::to_vec(&index).map_err(|error| {
-            ConflictableTransactionError::Abort(TxError::Serde(error.to_string()))
-        })?;
-        tx.insert(key.as_bytes(), value)?;
     }
-    Ok(())
+
+    fn write_cache(&self) -> RwLockWriteGuard<'_, SubscriptionCache> {
+        match self.cache.write() {
+            Ok(guard) => guard,
+            Err(error) => {
+                tracing::error!(
+                    event = "subscription.cache_lock_recovered",
+                    "subscription.cache_lock_recovered"
+                );
+                error.into_inner()
+            }
+        }
+    }
+
+    pub fn is_current(&self, snapshot: &SubscriptionSnapshot) -> bool {
+        self.read_cache()
+            .by_bark_id
+            .get(&snapshot.subscription.bark_id)
+            .is_some_and(|current| Arc::ptr_eq(current, &snapshot.version))
+    }
 }
 
-fn insert_geohash_subscription_tx(
-    tx: &TransactionalTree,
-    bark_id: &str,
-    geohash: &str,
-    subscription_value: Vec<u8>,
-) -> std::result::Result<(), ConflictableTransactionError<TxError>> {
-    let key = geohash_subscription_key(geohash, bark_id);
-    tx.insert(key.as_bytes(), subscription_value)?;
-    Ok(())
+fn mask_subscription_key(key: &[u8]) -> String {
+    let prefix = b"sub:";
+    if let Some(bark_id) = key.strip_prefix(prefix)
+        && let Ok(bark_id) = std::str::from_utf8(bark_id)
+    {
+        return mask_bark_id(bark_id);
+    }
+    "***".to_string()
 }
 
-fn remove_from_geohash_subscription_tx(
-    tx: &TransactionalTree,
-    bark_id: &str,
-    geohash: &str,
-) -> std::result::Result<(), ConflictableTransactionError<TxError>> {
-    let key = geohash_subscription_key(geohash, bark_id);
-    tx.remove(key.as_bytes())?;
-    Ok(())
-}
-
-fn geohash_index_from_tx(
-    tx: &TransactionalTree,
-    key: &str,
-    geohash: &str,
-) -> std::result::Result<Option<GeoHashIndex>, ConflictableTransactionError<TxError>> {
-    let Some(value) = tx.get(key.as_bytes())? else {
-        return Ok(None);
-    };
-    let index = serde_json::from_slice(&value).map_err(|error| {
-        ConflictableTransactionError::Abort(TxError::Serde(format!(
-            "GeoHash 索引数据格式错误: {geohash}: {error}"
-        )))
-    })?;
-    Ok(Some(index))
-}
-
-fn subscription_geohashes(subscription: &Subscription) -> HashSet<String> {
-    subscription
-        .normalized_locations()
-        .into_iter()
-        .filter_map(|location| geohash::try_encode(location.latitude, location.longitude))
-        .collect()
-}
-
-fn geohash_subscription_key(geohash: &str, bark_id: &str) -> String {
-    format!("geo_sub:{geohash}:{bark_id}")
+fn subscription_key_matches(key: &[u8], bark_id: &str) -> bool {
+    key.strip_prefix(b"sub:") == Some(bark_id.as_bytes())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::models::{NotificationBand, SubscriptionLocation};
+    use std::sync::{MutexGuard, OnceLock};
+
+    fn database_test_guard() -> Result<MutexGuard<'static, ()>> {
+        static DATABASE_TEST_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        DATABASE_TEST_LOCK
+            .get_or_init(|| Mutex::new(()))
+            .lock()
+            .map_err(|error| anyhow!("database test lock poisoned: {error}"))
+    }
 
     fn temporary_store() -> Result<SubscriptionStore> {
         let db = sled::Config::new().temporary(true).open()?;
-        Ok(SubscriptionStore::new(db))
+        SubscriptionStore::new(db)
     }
 
     fn subscription(bark_id: &str, lat: f64, lon: f64) -> Subscription {
@@ -301,49 +257,44 @@ mod tests {
         subscription
     }
 
-    fn collect_by_geohashes(
-        store: &SubscriptionStore,
-        geohashes: &[String],
-    ) -> Result<Vec<Subscription>> {
+    fn collect_subscriptions(store: &SubscriptionStore) -> Result<Vec<Subscription>> {
         let mut subscriptions = Vec::new();
-        store.for_each_subscription_by_geohashes(geohashes, |subscription| {
-            subscriptions.push(subscription);
+        store.for_each_subscription(|snapshot| {
+            subscriptions.push((*snapshot.subscription).clone());
             Ok(())
         })?;
         Ok(subscriptions)
     }
 
     #[test]
-    fn bucket_index_tracks_insert_update_and_delete() -> Result<()> {
+    fn primary_records_are_globally_iterable_and_track_updates() -> Result<()> {
+        let _database_guard = database_test_guard()?;
         let store = temporary_store()?;
         let beijing = subscription("abc123", 39.9042, 116.4074);
         let shanghai = subscription("abc123", 31.2397, 121.4999);
 
-        let Some(beijing_geohash) = geohash::try_encode(beijing.latitude, beijing.longitude) else {
-            anyhow::bail!("failed to geohash beijing")
-        };
-        let Some(shanghai_geohash) = geohash::try_encode(shanghai.latitude, shanghai.longitude)
-        else {
-            anyhow::bail!("failed to geohash shanghai")
-        };
-
         store.upsert_subscription(beijing)?;
-        let found = collect_by_geohashes(&store, std::slice::from_ref(&beijing_geohash))?;
+        let found = collect_subscriptions(&store)?;
         anyhow::ensure!(found.len() == 1, "expected one beijing subscription");
         anyhow::ensure!(found[0].bark_id == "abc123", "unexpected bark id");
 
         store.upsert_subscription(shanghai)?;
-        let old_bucket = collect_by_geohashes(&store, &[beijing_geohash])?;
-        anyhow::ensure!(old_bucket.is_empty(), "old geohash bucket must be empty");
+        let updated = collect_subscriptions(&store)?;
+        anyhow::ensure!(updated.len() == 1, "expected one updated subscription");
+        anyhow::ensure!(updated[0].longitude == 121.4999, "unexpected longitude");
 
-        let new_bucket = collect_by_geohashes(&store, std::slice::from_ref(&shanghai_geohash))?;
-        anyhow::ensure!(new_bucket.len() == 1, "expected one shanghai subscription");
-        anyhow::ensure!(new_bucket[0].longitude == 121.4999, "unexpected longitude");
+        store.upsert_subscription(subscription("tokyo1", 35.6762, 139.6503))?;
+        store.upsert_subscription(subscription("london1", 51.5072, -0.1276))?;
+        let subscriptions = collect_subscriptions(&store)?;
+        anyhow::ensure!(
+            subscriptions.len() == 3,
+            "all subscriptions must be evaluated globally"
+        );
 
         store.delete_subscription("abc123")?;
-        let after_delete = collect_by_geohashes(&store, &[shanghai_geohash])?;
+        let after_delete = collect_subscriptions(&store)?;
         anyhow::ensure!(
-            after_delete.is_empty(),
+            after_delete.len() == 2,
             "deleted subscription must not be returned"
         );
 
@@ -351,30 +302,150 @@ mod tests {
     }
 
     #[test]
-    fn lookup_can_read_legacy_geohash_index() -> Result<()> {
+    fn reloads_current_format_records_into_the_memory_snapshot() -> Result<()> {
+        let _database_guard = database_test_guard()?;
+        let db = sled::Config::new().temporary(true).open()?;
+        let store = SubscriptionStore::new(db.clone())?;
+        store.upsert_subscription(subscription("tokyo1", 35.6762, 139.6503))?;
+        store.upsert_subscription(subscription("london1", 51.5072, -0.1276))?;
+
+        let reloaded = SubscriptionStore::new(db)?;
+        let subscriptions = collect_subscriptions(&reloaded)?;
+        anyhow::ensure!(
+            subscriptions.len() == 2,
+            "expected both persisted subscriptions"
+        );
+        anyhow::ensure!(
+            reloaded.get_total_count()? == 2,
+            "snapshot count must be current"
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn snapshot_scan_scales_without_database_reads() -> Result<()> {
+        let _database_guard = database_test_guard()?;
         let store = temporary_store()?;
-        let subscription = subscription("legacy1", 39.9042, 116.4074);
-        let Some(geohash) = geohash::try_encode(subscription.latitude, subscription.longitude)
-        else {
-            anyhow::bail!("failed to geohash legacy subscription")
-        };
-        let bark_id = subscription.bark_id.clone();
+        {
+            let mut cache = store.write_cache();
+            for index in 0..100_000 {
+                let subscription = subscription(&format!("device{index:06}"), 35.6762, 139.6503);
+                cache
+                    .by_bark_id
+                    .insert(subscription.bark_id.clone(), Arc::new(subscription));
+            }
+            cache.snapshot_dirty = true;
+        }
 
-        let subscription_value = serde_json::to_vec(&subscription)?;
-        store
-            .db
-            .insert(format!("sub:{bark_id}").as_bytes(), subscription_value)?;
-        let legacy_index = GeoHashIndex {
-            bark_ids: vec![bark_id],
-        };
-        store.db.insert(
-            format!("geo:{geohash}").as_bytes(),
-            serde_json::to_vec(&legacy_index)?,
-        )?;
+        let mut count = 0usize;
+        store.for_each_subscription(|_snapshot| {
+            count += 1;
+            Ok(())
+        })?;
+        anyhow::ensure!(
+            count == 100_000,
+            "snapshot scan must include every subscription"
+        );
 
-        let found = collect_by_geohashes(&store, &[geohash])?;
-        anyhow::ensure!(found.len() == 1, "expected one legacy subscription");
-        anyhow::ensure!(found[0].bark_id == "legacy1", "unexpected legacy bark id");
+        Ok(())
+    }
+
+    #[test]
+    fn concurrent_writes_keep_persistence_and_snapshot_consistent() -> Result<()> {
+        let _database_guard = database_test_guard()?;
+        let db = sled::Config::new().temporary(true).open()?;
+        let store = SubscriptionStore::new(db.clone())?;
+        let mut writers = Vec::new();
+        for index in 0..32 {
+            let store = store.clone();
+            writers.push(std::thread::spawn(move || {
+                store.upsert_subscription(subscription(
+                    &format!("device{index:02}"),
+                    35.6762,
+                    139.6503,
+                ))
+            }));
+        }
+        for writer in writers {
+            match writer.join() {
+                Ok(result) => result?,
+                Err(_panic_payload) => return Err(anyhow!("subscription writer panicked")),
+            }
+        }
+
+        anyhow::ensure!(
+            store.get_total_count()? == 32,
+            "snapshot must include all writes"
+        );
+        let reloaded = SubscriptionStore::new(db)?;
+        anyhow::ensure!(
+            reloaded.get_total_count()? == 32,
+            "persisted records must match the snapshot"
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn stale_snapshot_is_invalidated_by_an_update_or_delete() -> Result<()> {
+        let _database_guard = database_test_guard()?;
+        let store = temporary_store()?;
+        store.upsert_subscription(subscription("device1", 35.6762, 139.6503))?;
+
+        let mut snapshot = None;
+        store.for_each_subscription(|current| {
+            snapshot = Some(current);
+            Ok(())
+        })?;
+        let Some(snapshot) = snapshot else {
+            anyhow::bail!("expected a subscription snapshot");
+        };
+        anyhow::ensure!(store.is_current(&snapshot), "snapshot should start current");
+
+        store.upsert_subscription(subscription("device1", 51.5072, -0.1276))?;
+        anyhow::ensure!(
+            !store.is_current(&snapshot),
+            "update must invalidate old snapshot"
+        );
+
+        let mut replacement = None;
+        store.for_each_subscription(|current| {
+            replacement = Some(current);
+            Ok(())
+        })?;
+        let Some(replacement) = replacement else {
+            anyhow::bail!("expected replacement snapshot");
+        };
+        anyhow::ensure!(
+            store.is_current(&replacement),
+            "replacement must be current"
+        );
+
+        store.delete_subscription("device1")?;
+        anyhow::ensure!(
+            !store.is_current(&replacement),
+            "delete must invalidate snapshot"
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn startup_normalizes_current_format_notification_levels() -> Result<()> {
+        let _database_guard = database_test_guard()?;
+        let db = sled::Config::new().temporary(true).open()?;
+        let mut stored = subscription("device1", 35.6762, 139.6503);
+        stored.notify_bands[0].level = " Active ".to_string();
+        db.insert(b"sub:device1", serde_json::to_vec(&stored)?)?;
+
+        let store = SubscriptionStore::new(db)?;
+        let mut normalized = false;
+        store.for_each_subscription(|snapshot| {
+            normalized = snapshot.subscription.level_for_intensity(3) == Some("active");
+            Ok(())
+        })?;
+        anyhow::ensure!(normalized, "startup must normalize stored levels");
 
         Ok(())
     }

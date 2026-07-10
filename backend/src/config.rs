@@ -27,7 +27,6 @@ pub struct Config {
     pub s_wave_km_s: f64,
     pub stale_origin_seconds: i64,
     pub dedup_keep_minutes: u64,
-    pub max_distance_km: f64,
     /// 并发推送的最大数量
     pub max_concurrent_notifications: usize,
     /// HTTP 连接池大小
@@ -61,8 +60,7 @@ impl Config {
             s_wave_km_s: env_parse("S_WAVE_KM_S", 3.5)?,
             stale_origin_seconds: env_parse("STALE_ORIGIN_SECONDS", 600)?,
             dedup_keep_minutes: env_parse("DEDUP_KEEP_MINUTES", 120)?,
-            max_distance_km: env_parse("MAX_DISTANCE_KM", 1000.0)?,
-            max_concurrent_notifications: env_parse("MAX_CONCURRENT_NOTIFICATIONS", 1000)?,
+            max_concurrent_notifications: env_parse("MAX_CONCURRENT_NOTIFICATIONS", 200)?,
             http_pool_size: env_parse("HTTP_POOL_SIZE", 200)?,
         };
         config.validate()?;
@@ -87,9 +85,6 @@ impl Config {
         }
         if self.dedup_keep_minutes == 0 {
             bail!("DEDUP_KEEP_MINUTES must be greater than 0");
-        }
-        if !(self.max_distance_km.is_finite() && self.max_distance_km >= 0.0) {
-            bail!("MAX_DISTANCE_KM must be a finite non-negative number");
         }
         if self.max_concurrent_notifications == 0 || self.max_concurrent_notifications > 10_000 {
             bail!("MAX_CONCURRENT_NOTIFICATIONS must be in 1..=10000");

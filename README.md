@@ -8,8 +8,8 @@
 
 1. Wolfx WebSocket 推送 JMA / 四川 / CENC / 福建 / 重庆地震预警消息到后端
 2. 后端解析消息，转换为通用格式，过滤演练 / 取消 / 过期 / 重复事件
-3. 用 GeoHash 邻居格子查出相关订阅，按震中距估算 JMA 震度并匹配通知级别
-4. 通过 Bark 向命中订阅推送预警，命中推送失败时自动清理无效 Bark Key
+3. 从内存快照流式遍历全部订阅，按各监测点的震源距估算 JMA 震度并匹配通知级别
+4. 同一事件的待处理更新自动合并为最新报告，再通过 Bark 并发推送；命中推送失败时自动清理无效 Bark Key
 
 ## 技术栈
 
@@ -126,8 +126,7 @@ set -a; . ./.env; set +a
 | `S_WAVE_KM_S` | `3.5` | S 波传播速度 (km/s) |
 | `STALE_ORIGIN_SECONDS` | `600` | 发震时间超过该秒数视为过期 |
 | `DEDUP_KEEP_MINUTES` | `120` | 事件去重窗口分钟数 |
-| `MAX_DISTANCE_KM` | `1000` | 订阅者最大推送距离 (km)，0 表示不限制 |
-| `MAX_CONCURRENT_NOTIFICATIONS` | `1000` | 并发推送上限 |
+| `MAX_CONCURRENT_NOTIFICATIONS` | `200` | 并发推送上限；实际值不会超过 `HTTP_POOL_SIZE` |
 | `HTTP_POOL_SIZE` | `200` | HTTP 连接池大小 |
 
 ## API

@@ -1,16 +1,14 @@
 use crate::config::Config;
-use crate::db::Database;
-use crate::models::{
-    CommonEarthquakeInfo, EarthquakeData, Subscription, WebSocketMessage, mask_bark_id,
-};
+use crate::db::{Database, SubscriptionSnapshot};
+use crate::models::{CommonEarthquakeInfo, EarthquakeData, WebSocketMessage, mask_bark_id};
 use crate::services::{AlertRecipient, AlertTiming, BarkNotifier};
-use crate::utils::{distance, geohash, intensity};
+use crate::utils::{distance, intensity};
 use anyhow::Result;
 use futures_util::{SinkExt, StreamExt, stream};
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
-use tokio::sync::{Mutex, mpsc};
+use tokio::sync::{Mutex, Notify, mpsc};
 use tokio_tungstenite::{connect_async, tungstenite::Message};
 
 #[derive(Clone)]
@@ -26,7 +24,6 @@ struct MonitorConfig {
     s_wave_km_s: f64,
     stale_origin_seconds: i64,
     dedup_keep: Duration,
-    max_distance_km: f64,
 }
 
 #[derive(Clone)]
@@ -36,6 +33,7 @@ struct SeenEvent {
 }
 
 struct PushTarget {
+    subscription: SubscriptionSnapshot,
     recipient: AlertRecipient,
     level: String,
     timing: AlertTiming,
@@ -46,6 +44,51 @@ struct NotifyCounts {
     filtered: usize,
     notified: usize,
     errors: usize,
+}
+
+#[derive(Default)]
+struct EventQueue {
+    state: Mutex<EventQueueState>,
+    ready: Notify,
+}
+
+#[derive(Default)]
+struct EventQueueState {
+    order: VecDeque<String>,
+    pending: HashMap<String, CommonEarthquakeInfo>,
+}
+
+impl EventQueue {
+    async fn push(&self, earthquake: CommonEarthquakeInfo) {
+        let key = earthquake_key(&earthquake);
+        let mut state = self.state.lock().await;
+        if let Some(current) = state.pending.get(&key)
+            && current.report_num > earthquake.report_num
+        {
+            return;
+        }
+        if !state.pending.contains_key(&key) {
+            state.order.push_back(key.clone());
+        }
+        state.pending.insert(key, earthquake);
+        drop(state);
+        self.ready.notify_one();
+    }
+
+    async fn pop(&self) -> CommonEarthquakeInfo {
+        loop {
+            let notified = self.ready.notified();
+            {
+                let mut state = self.state.lock().await;
+                while let Some(key) = state.order.pop_front() {
+                    if let Some(earthquake) = state.pending.remove(&key) {
+                        return earthquake;
+                    }
+                }
+            }
+            notified.await;
+        }
+    }
 }
 
 /// 监听 EEW WebSocket，并把匹配订阅的事件转成 Bark 推送
@@ -59,7 +102,10 @@ pub struct EarthquakeMonitor {
 
 impl EarthquakeMonitor {
     pub fn new(db: Database, config: Config, bark_notifier: BarkNotifier) -> Result<Self> {
-        let max_concurrent = config.max_concurrent_notifications.max(1);
+        let max_concurrent = config
+            .max_concurrent_notifications
+            .min(config.http_pool_size)
+            .max(1);
         let monitor_config = MonitorConfig {
             websocket_url: config.eew_websocket_url.clone(),
             reconnect_min: Duration::from_secs(config.reconnect_min_seconds.max(1)),
@@ -84,12 +130,12 @@ impl EarthquakeMonitor {
             },
             stale_origin_seconds: config.stale_origin_seconds,
             dedup_keep: Duration::from_secs(config.dedup_keep_minutes.max(1) * 60),
-            max_distance_km: config.max_distance_km,
         };
 
         tracing::info!(
             event = "monitor.initialized",
             max_concurrent,
+            configured_max_concurrent = config.max_concurrent_notifications,
             http_pool_size = config.http_pool_size,
             websocket_url = %monitor_config.websocket_url,
             "monitor.initialized"
@@ -106,6 +152,14 @@ impl EarthquakeMonitor {
 
     /// 启动 WebSocket 循环；连接断开后按指数退避重连
     pub async fn start(&self) -> Result<()> {
+        let event_queue = EventQueue::default();
+        tokio::select! {
+            result = self.run_connection_loop(&event_queue) => result,
+            result = self.run_notification_worker(&event_queue) => result,
+        }
+    }
+
+    async fn run_connection_loop(&self, event_queue: &EventQueue) -> Result<()> {
         let mut reconnect_delay = self.config.reconnect_min;
         let mut consecutive_errors = 0u64;
         loop {
@@ -115,7 +169,7 @@ impl EarthquakeMonitor {
                 "websocket.connecting"
             );
 
-            match self.connect_and_monitor().await {
+            match self.connect_and_monitor(event_queue).await {
                 Ok(_) => {
                     tracing::warn!(event = "websocket.closed", "websocket.closed");
                     reconnect_delay = self.config.reconnect_min;
@@ -137,7 +191,23 @@ impl EarthquakeMonitor {
         }
     }
 
-    async fn connect_and_monitor(&self) -> Result<()> {
+    async fn run_notification_worker(&self, event_queue: &EventQueue) -> Result<()> {
+        loop {
+            let earthquake = event_queue.pop().await;
+            if let Err(error) = self.notify_subscribers(&earthquake).await {
+                tracing::error!(
+                    event = "eew.notify_failed",
+                    event_key = %earthquake_key(&earthquake),
+                    error = ?error,
+                    "eew.notify_failed"
+                );
+                event_queue.push(earthquake).await;
+                tokio::time::sleep(self.config.reconnect_min).await;
+            }
+        }
+    }
+
+    async fn connect_and_monitor(&self, event_queue: &EventQueue) -> Result<()> {
         let (ws_stream, _) = connect_async(&self.config.websocket_url).await?;
         tracing::info!(
             event = "websocket.connected",
@@ -160,7 +230,7 @@ impl EarthquakeMonitor {
                         );
                         continue;
                     }
-                    if let Err(e) = self.handle_earthquake_message(&text).await {
+                    if let Err(e) = self.enqueue_earthquake_message(event_queue, &text).await {
                         tracing::error!(event = "eew.handle_failed", error = ?e, "eew.handle_failed");
                     }
                 }
@@ -183,7 +253,11 @@ impl EarthquakeMonitor {
         Ok(())
     }
 
-    async fn handle_earthquake_message(&self, message: &str) -> Result<()> {
+    async fn enqueue_earthquake_message(
+        &self,
+        event_queue: &EventQueue,
+        message: &str,
+    ) -> Result<()> {
         let msg_wrapper: WebSocketMessage = match serde_json::from_str(message) {
             Ok(data) => data,
             Err(e) => {
@@ -246,12 +320,11 @@ impl EarthquakeMonitor {
             "eew.received"
         );
 
-        if self.should_skip_event(&common_info).await {
+        if !self.reserve_event(&common_info).await {
             return Ok(());
         }
 
-        self.notify_subscribers(&common_info).await?;
-        self.mark_event_seen(&common_info).await;
+        event_queue.push(common_info).await;
 
         Ok(())
     }
@@ -259,8 +332,7 @@ impl EarthquakeMonitor {
     async fn notify_subscribers(&self, earthquake: &CommonEarthquakeInfo) -> Result<()> {
         let start_time = Instant::now();
 
-        let Some(center_geohash) = geohash::try_encode(earthquake.latitude, earthquake.longitude)
-        else {
+        if !crate::models::valid_coordinate(earthquake.latitude, earthquake.longitude) {
             tracing::warn!(
                 event = "notify.invalid_coordinates",
                 latitude = earthquake.latitude,
@@ -268,15 +340,12 @@ impl EarthquakeMonitor {
                 "notify.invalid_coordinates"
             );
             return Ok(());
-        };
-        let neighbor_geohashes = geohash::try_get_neighbors(&center_geohash).unwrap_or_default();
+        }
 
         let event_key = earthquake_key(earthquake);
         tracing::info!(
             event = "notify.lookup_started",
             event_key = %event_key,
-            center_geohash = %center_geohash,
-            geohash_count = neighbor_geohashes.len(),
             "notify.lookup_started"
         );
 
@@ -286,13 +355,17 @@ impl EarthquakeMonitor {
         let store = self.db.subscriptions();
         let config = self.config.clone();
         let earthquake_for_lookup = earthquake.clone();
+        let elapsed_since_origin = elapsed_since_origin_seconds(earthquake);
         let lookup_handle = tokio::task::spawn_blocking(move || {
             let mut total_candidates = 0usize;
-            store.for_each_subscription_by_geohashes(&neighbor_geohashes, |subscription| {
+            store.for_each_subscription(|subscription| {
                 total_candidates += 1;
-                if let Some(target) =
-                    evaluate_subscription(&config, &subscription, &earthquake_for_lookup)
-                {
+                if let Some(target) = evaluate_subscription(
+                    &config,
+                    &subscription,
+                    &earthquake_for_lookup,
+                    elapsed_since_origin,
+                ) {
                     target_sender.blocking_send(target).map_err(|error| {
                         anyhow::anyhow!("notification target receiver closed: {error}")
                     })?;
@@ -315,6 +388,9 @@ impl EarthquakeMonitor {
                 let earthquake = Arc::clone(&earthquake);
 
                 async move {
+                    if !bark_notifier.is_subscription_current(&target.subscription) {
+                        return None;
+                    }
                     let bark_id = target.recipient.bark_id.clone();
                     tracing::debug!(
                         event = "notify.send_started",
@@ -334,7 +410,7 @@ impl EarthquakeMonitor {
                         )
                         .await
                     {
-                        Ok(_) => true,
+                        Ok(_) => Some(true),
                         Err(e) => {
                             tracing::error!(
                                 event = "notify.send_failed",
@@ -342,18 +418,20 @@ impl EarthquakeMonitor {
                                 error = ?e,
                                 "notify.send_failed"
                             );
-                            false
+                            Some(false)
                         }
                     }
                 }
             })
             .buffer_unordered(self.max_concurrent)
-            .fold(NotifyCounts::default(), |mut counts, success| async move {
-                counts.filtered += 1;
-                if success {
-                    counts.notified += 1;
-                } else {
-                    counts.errors += 1;
+            .fold(NotifyCounts::default(), |mut counts, result| async move {
+                if let Some(success) = result {
+                    counts.filtered += 1;
+                    if success {
+                        counts.notified += 1;
+                    } else {
+                        counts.errors += 1;
+                    }
                 }
                 counts
             })
@@ -416,7 +494,7 @@ impl EarthquakeMonitor {
         Ok(())
     }
 
-    async fn should_skip_event(&self, earthquake: &CommonEarthquakeInfo) -> bool {
+    async fn reserve_event(&self, earthquake: &CommonEarthquakeInfo) -> bool {
         if earthquake.training && self.config.ignore_training {
             tracing::info!(
                 event = "eew.skipped",
@@ -424,7 +502,7 @@ impl EarthquakeMonitor {
                 event_key = %earthquake_key(earthquake),
                 "eew.skipped"
             );
-            return true;
+            return false;
         }
         if earthquake.cancel && self.config.ignore_cancel {
             tracing::info!(
@@ -433,7 +511,7 @@ impl EarthquakeMonitor {
                 event_key = %earthquake_key(earthquake),
                 "eew.skipped"
             );
-            return true;
+            return false;
         }
         if self.config.stale_origin_seconds > 0
             && let Some(age_seconds) = origin_age_seconds(earthquake)
@@ -447,7 +525,7 @@ impl EarthquakeMonitor {
                 stale_origin_seconds = self.config.stale_origin_seconds,
                 "eew.skipped"
             );
-            return true;
+            return false;
         }
 
         let mut seen = self.seen_events.lock().await;
@@ -470,16 +548,9 @@ impl EarthquakeMonitor {
                     report_num = earthquake.report_num,
                     "eew.skipped"
                 );
-                return true;
+                return false;
             }
         }
-        false
-    }
-
-    async fn mark_event_seen(&self, earthquake: &CommonEarthquakeInfo) {
-        let mut seen = self.seen_events.lock().await;
-        let key = earthquake_key(earthquake);
-        let now = Instant::now();
         seen.insert(
             key,
             SeenEvent {
@@ -487,6 +558,7 @@ impl EarthquakeMonitor {
                 at: now,
             },
         );
+        true
     }
 }
 
@@ -498,49 +570,65 @@ fn is_wolfx_heartbeat(message: &str) -> bool {
 
 fn evaluate_subscription(
     config: &MonitorConfig,
-    subscription: &Subscription,
+    subscription: &SubscriptionSnapshot,
     earthquake: &CommonEarthquakeInfo,
+    elapsed_since_origin: Option<i64>,
 ) -> Option<PushTarget> {
     let mut best: Option<PushTarget> = None;
-    for location in subscription.normalized_locations() {
-        let dist = distance::vincenty_distance(
-            earthquake.latitude,
-            earthquake.longitude,
-            location.latitude,
-            location.longitude,
-        )?;
-        if config.max_distance_km > 0.0 && dist > config.max_distance_km {
-            continue;
-        }
-        let hypocentral_km = (dist.powi(2) + earthquake.depth.max(0.0).powi(2)).sqrt();
-        let estimated_intensity =
-            intensity::estimate_intensity(earthquake.magnitude, hypocentral_km);
-        let level = subscription.level_for_intensity(estimated_intensity)?;
-        let timing = AlertTiming {
-            distance_km: dist,
-            hypocentral_km,
-            estimated_intensity,
-            seconds_to_p: seconds_until_arrival(earthquake, hypocentral_km, config.p_wave_km_s),
-            seconds_to_s: seconds_until_arrival(earthquake, hypocentral_km, config.s_wave_km_s),
-        };
-        let replace = best
-            .as_ref()
-            .map(|current| timing.distance_km < current.timing.distance_km)
-            .unwrap_or(true);
-        if replace {
-            best = Some(PushTarget {
-                recipient: AlertRecipient {
-                    bark_id: subscription.bark_id.clone(),
-                    bark_url: subscription.bark_url.clone(),
-                    location_name: location.name,
-                    latitude: location.latitude,
-                    longitude: location.longitude,
-                },
-                level,
-                timing,
-            });
-        }
-    }
+    subscription
+        .subscription
+        .for_each_normalized_location(|location_name, latitude, longitude| {
+            let Some(dist) = distance::vincenty_distance(
+                earthquake.latitude,
+                earthquake.longitude,
+                latitude,
+                longitude,
+            ) else {
+                return;
+            };
+            let hypocentral_km = (dist.powi(2) + earthquake.depth.max(0.0).powi(2)).sqrt();
+            let estimated_intensity =
+                intensity::estimate_intensity(earthquake.magnitude, hypocentral_km);
+            let Some(level) = subscription
+                .subscription
+                .level_for_intensity(estimated_intensity)
+            else {
+                return;
+            };
+            let timing = AlertTiming {
+                distance_km: dist,
+                hypocentral_km,
+                estimated_intensity,
+                seconds_to_p: seconds_until_arrival(
+                    hypocentral_km,
+                    config.p_wave_km_s,
+                    elapsed_since_origin,
+                ),
+                seconds_to_s: seconds_until_arrival(
+                    hypocentral_km,
+                    config.s_wave_km_s,
+                    elapsed_since_origin,
+                ),
+            };
+            let replace = best
+                .as_ref()
+                .map(|current| timing.distance_km < current.timing.distance_km)
+                .unwrap_or(true);
+            if replace {
+                best = Some(PushTarget {
+                    subscription: subscription.clone(),
+                    recipient: AlertRecipient {
+                        bark_id: subscription.subscription.bark_id.clone(),
+                        bark_url: subscription.subscription.bark_url.clone(),
+                        location_name: location_name.to_string(),
+                        latitude,
+                        longitude,
+                    },
+                    level: level.to_string(),
+                    timing,
+                });
+            }
+        });
     best
 }
 
@@ -560,29 +648,22 @@ fn earthquake_key(earthquake: &CommonEarthquakeInfo) -> String {
 }
 
 fn seconds_until_arrival(
-    earthquake: &CommonEarthquakeInfo,
     hypocentral_km: f64,
     speed: f64,
+    elapsed_since_origin: Option<i64>,
 ) -> i64 {
     if !speed.is_finite() || speed <= 0.0 {
         return 0;
     }
     let travel_seconds = (hypocentral_km / speed).round() as i64;
-    if let Some(origin_epoch) = parse_origin_epoch_seconds(earthquake) {
-        let now = match SystemTime::now().duration_since(UNIX_EPOCH) {
-            Ok(duration) => duration.as_secs() as i64,
-            Err(error) => {
-                tracing::error!(event = "clock_error", error = ?error, "clock_error");
-                return travel_seconds;
-            }
-        };
-        origin_epoch + travel_seconds - now
-    } else {
-        travel_seconds
-    }
+    elapsed_since_origin.map_or(travel_seconds, |elapsed| travel_seconds - elapsed)
 }
 
 fn origin_age_seconds(earthquake: &CommonEarthquakeInfo) -> Option<i64> {
+    elapsed_since_origin_seconds(earthquake)
+}
+
+fn elapsed_since_origin_seconds(earthquake: &CommonEarthquakeInfo) -> Option<i64> {
     let origin_epoch = parse_origin_epoch_seconds(earthquake)?;
     let now = match SystemTime::now().duration_since(UNIX_EPOCH) {
         Ok(duration) => duration.as_secs() as i64,
@@ -604,26 +685,23 @@ fn parse_origin_epoch_seconds(earthquake: &CommonEarthquakeInfo) -> Option<i64> 
 }
 
 fn parse_datetime_epoch_seconds(value: &str, offset_seconds: i64) -> Option<i64> {
-    let normalized = value.trim().replace('T', " ").replace('/', "-");
-    let (date, time) = normalized.split_once(' ')?;
-    let date_parts = date.split('-').collect::<Vec<_>>();
-    if date_parts.len() != 3 {
+    let (date, time) = value.trim().split_once([' ', 'T'])?;
+    let mut date_parts = date.split(['-', '/']);
+    let year = date_parts.next()?.parse::<i64>().ok()?;
+    let month = date_parts.next()?.parse::<i64>().ok()?;
+    let day = date_parts.next()?.parse::<i64>().ok()?;
+    if date_parts.next().is_some() {
         return None;
     }
-    let year = date_parts[0].parse::<i64>().ok()?;
-    let month = date_parts[1].parse::<i64>().ok()?;
-    let day = date_parts[2].parse::<i64>().ok()?;
-    let time_parts = time.split(':').collect::<Vec<_>>();
-    if !(2..=3).contains(&time_parts.len()) {
+    let mut time_parts = time.split(':');
+    let hour = time_parts.next()?.parse::<i64>().ok()?;
+    let minute = time_parts.next()?.parse::<i64>().ok()?;
+    let second = time_parts
+        .next()
+        .map_or(Some(0), |value| value.parse().ok())?;
+    if time_parts.next().is_some() {
         return None;
     }
-    let hour = time_parts[0].parse::<i64>().ok()?;
-    let minute = time_parts[1].parse::<i64>().ok()?;
-    let second = if time_parts.len() == 3 {
-        time_parts[2].parse::<i64>().ok()?
-    } else {
-        0
-    };
     if !(1..=12).contains(&month)
         || !(1..=days_in_month(year, month)).contains(&day)
         || !(0..=23).contains(&hour)
@@ -663,6 +741,25 @@ fn days_from_civil(year: i64, month: i64, day: i64) -> i64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::models::Subscription;
+
+    fn queued_earthquake(event_id: &str, report_num: u32) -> CommonEarthquakeInfo {
+        CommonEarthquakeInfo {
+            event_id: event_id.to_string(),
+            report_num,
+            latitude: 0.0,
+            longitude: 0.0,
+            magnitude: 5.0,
+            depth: 10.0,
+            max_intensity: "3".to_string(),
+            region: String::new(),
+            origin_time: "2026-07-10 00:00:00".to_string(),
+            source_type: "cenc_eew".to_string(),
+            final_report: false,
+            cancel: false,
+            training: false,
+        }
+    }
 
     #[test]
     fn parses_space_slash_and_timestamps_with_timezone_offsets() {
@@ -697,5 +794,117 @@ mod tests {
         assert!(is_wolfx_heartbeat(r#"{"type":"heartbeat","ver":1}"#));
         assert!(!is_wolfx_heartbeat(r#"{"type":"jma_eew"}"#));
         assert!(!is_wolfx_heartbeat("heartbeat"));
+    }
+
+    #[test]
+    fn evaluates_distant_locations_without_a_distance_cutoff() {
+        let config = MonitorConfig {
+            websocket_url: String::new(),
+            reconnect_min: Duration::from_secs(1),
+            reconnect_max: Duration::from_secs(30),
+            push_updates: false,
+            update_min_report_gap: 1,
+            ignore_training: true,
+            ignore_cancel: true,
+            p_wave_km_s: 6.0,
+            s_wave_km_s: 3.5,
+            stale_origin_seconds: 600,
+            dedup_keep: Duration::from_secs(120 * 60),
+        };
+        let mut subscription = Subscription::new("device1".to_string(), 0.0, 180.0);
+        subscription.bark_url = "https://api.day.app".to_string();
+        subscription.locations = vec![
+            crate::models::SubscriptionLocation {
+                name: "antipode".to_string(),
+                latitude: 0.0,
+                longitude: 180.0,
+            },
+            crate::models::SubscriptionLocation {
+                name: "london".to_string(),
+                latitude: 51.5072,
+                longitude: -0.1276,
+            },
+        ];
+        subscription.notify_bands = vec![crate::models::NotificationBand {
+            min: 0,
+            max: 99,
+            level: "passive".to_string(),
+            label: String::new(),
+        }];
+        let earthquake = CommonEarthquakeInfo {
+            event_id: "global1".to_string(),
+            report_num: 1,
+            latitude: 0.0,
+            longitude: 0.0,
+            magnitude: 9.0,
+            depth: 10.0,
+            max_intensity: "7".to_string(),
+            region: "test".to_string(),
+            origin_time: "2026-07-10 00:00:00".to_string(),
+            source_type: "cenc_eew".to_string(),
+            final_report: false,
+            cancel: false,
+            training: false,
+        };
+
+        let subscription = SubscriptionSnapshot::new(Arc::new(subscription));
+        let target = evaluate_subscription(&config, &subscription, &earthquake, Some(0));
+        assert!(
+            target.is_some(),
+            "a distant valid location must still be evaluated"
+        );
+        if let Some(target) = target {
+            assert_eq!(target.recipient.location_name, "london");
+            assert!(target.timing.distance_km > 1_000.0);
+        }
+    }
+
+    #[tokio::test]
+    async fn event_queue_coalesces_updates_without_dropping_distinct_events() {
+        let queue = EventQueue::default();
+        queue.push(queued_earthquake("event-a", 1)).await;
+        queue.push(queued_earthquake("event-a", 3)).await;
+        queue.push(queued_earthquake("event-a", 2)).await;
+        queue.push(queued_earthquake("event-b", 1)).await;
+
+        let first = queue.pop().await;
+        let second = queue.pop().await;
+        assert_eq!((first.event_id.as_str(), first.report_num), ("event-a", 3));
+        assert_eq!(
+            (second.event_id.as_str(), second.report_num),
+            ("event-b", 1)
+        );
+    }
+
+    #[test]
+    fn evaluates_one_hundred_thousand_subscription_targets() {
+        let config = MonitorConfig {
+            websocket_url: String::new(),
+            reconnect_min: Duration::from_secs(1),
+            reconnect_max: Duration::from_secs(30),
+            push_updates: false,
+            update_min_report_gap: 1,
+            ignore_training: true,
+            ignore_cancel: true,
+            p_wave_km_s: 6.0,
+            s_wave_km_s: 3.5,
+            stale_origin_seconds: 600,
+            dedup_keep: Duration::from_secs(120 * 60),
+        };
+        let mut subscription = Subscription::new("device1".to_string(), 35.6762, 139.6503);
+        subscription.bark_url = "https://api.day.app".to_string();
+        subscription.notify_bands = vec![crate::models::NotificationBand {
+            min: 0,
+            max: 99,
+            level: "passive".to_string(),
+            label: String::new(),
+        }];
+        let snapshot = SubscriptionSnapshot::new(Arc::new(subscription));
+        let earthquake = queued_earthquake("performance", 1);
+
+        let matched = (0..100_000)
+            .filter(|_| evaluate_subscription(&config, &snapshot, &earthquake, Some(0)).is_some())
+            .count();
+        assert_eq!(matched, 100_000);
     }
 }

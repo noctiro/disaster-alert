@@ -1,4 +1,4 @@
-name = "earthquake-alert"
+name = "disaster-alert"
 main = "index.js"
 compatibility_date = "2025-12-28"
 
@@ -13,7 +13,7 @@ ALLOWED_ORIGINS = "http://localhost:8787"
 
 [env.production.vars]
 BACKEND_URL = "https://your-backend-server.com"
-ALLOWED_ORIGINS = "https://eew.example.com"
+ALLOWED_ORIGINS = "https://alert.example.com"
 
 # [observability]
 # enabled = false

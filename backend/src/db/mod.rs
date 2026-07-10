@@ -3,7 +3,9 @@ use std::path::Path;
 
 mod subscription_store;
 
-pub use subscription_store::{StoreErrorKind, SubscriptionSnapshot, SubscriptionStore};
+pub use subscription_store::{
+    StoreErrorKind, SubscriptionCandidateQuery, SubscriptionSnapshot, SubscriptionStore,
+};
 
 /// 数据库封装
 #[derive(Clone)]

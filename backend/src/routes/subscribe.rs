@@ -4,10 +4,16 @@ use crate::models::{
     ApiResponse, NotificationBand, SubscribeRequest, Subscription, SubscriptionLocation,
     UnsubscribeRequest, mask_bark_id, validate_bark_level,
 };
-use crate::services::BarkNotifier;
+use crate::services::{BarkNotifier, ReverseGeocodeResult, ReverseGeocoder, RuntimeStatus};
+use crate::source_registry::{SourceGroup, groups};
 use crate::utils::distance;
-use axum::{Json, extract::State, http::StatusCode, response::IntoResponse};
-use serde::Serialize;
+use axum::{
+    Json,
+    extract::{Query, State},
+    http::StatusCode,
+    response::IntoResponse,
+};
+use serde::{Deserialize, Serialize};
 
 const MAX_LOCATIONS: usize = 3;
 const MAX_LOCATION_NAME_CHARS: usize = 80;
@@ -19,6 +25,51 @@ pub struct AppState {
     pub db: Database,
     pub bark_notifier: BarkNotifier,
     pub bark_urls: Vec<String>,
+    pub runtime_status: RuntimeStatus,
+    pub reverse_geocoder: ReverseGeocoder,
+}
+
+#[derive(Deserialize)]
+pub struct ReverseGeocodeQuery {
+    latitude: f64,
+    longitude: f64,
+}
+
+pub async fn reverse_geocode_handler(
+    State(state): State<AppState>,
+    Query(query): Query<ReverseGeocodeQuery>,
+) -> impl IntoResponse {
+    if !distance::validate_coordinates(query.latitude, query.longitude) {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(ApiResponse::<ReverseGeocodeResult>::error("坐标无效")),
+        );
+    }
+    match state
+        .reverse_geocoder
+        .resolve(query.latitude, query.longitude)
+        .await
+    {
+        Ok(location) => (
+            StatusCode::OK,
+            Json(ApiResponse::success("区域信息解析成功", Some(location))),
+        ),
+        Err(error) => {
+            tracing::warn!(
+                event = "reverse_geocode.failed",
+                latitude = query.latitude,
+                longitude = query.longitude,
+                error = ?error,
+                "reverse_geocode.failed"
+            );
+            (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(ApiResponse::<ReverseGeocodeResult>::error(
+                    "区域信息暂时无法自动解析，请手动填写",
+                )),
+            )
+        }
+    }
 }
 
 pub async fn subscribe_handler(
@@ -70,9 +121,7 @@ pub async fn subscribe_handler(
             )),
         );
     }
-    let primary = locations[0].clone();
-
-    let notify_bands = match normalize_notify_bands(&payload) {
+    let notify_bands = match resolve_notify_bands(&payload) {
         Ok(bands) => bands,
         Err(message) => {
             return (
@@ -81,11 +130,28 @@ pub async fn subscribe_handler(
             );
         }
     };
-    let mut subscription = Subscription::new(bark_id, primary.latitude, primary.longitude);
+    if let Err(message) = payload.disaster_rules.validate() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(ApiResponse::<SubscribeResponse>::error(message)),
+        );
+    }
+    if payload.source_overrides.len() > 64
+        || payload
+            .source_overrides
+            .keys()
+            .any(|source| !known_source(source))
+    {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(ApiResponse::<SubscribeResponse>::error("灾害来源配置无效")),
+        );
+    }
+    let mut subscription = Subscription::new(bark_id, locations);
     subscription.bark_url = bark_url;
-    subscription.location_name = primary.name;
-    subscription.locations = locations;
     subscription.notify_bands = notify_bands;
+    subscription.disaster_rules = payload.disaster_rules;
+    subscription.source_overrides = payload.source_overrides;
 
     tracing::info!(
         event = "subscription.requested",
@@ -150,6 +216,26 @@ pub async fn subscribe_handler(
     }
 }
 
+fn known_source(source: &str) -> bool {
+    crate::source_registry::find(source).is_some()
+}
+
+#[derive(Serialize)]
+pub struct SubscriptionOptionsResponse {
+    pub groups: Vec<SourceGroup>,
+    pub defaults: crate::models::DisasterRules,
+}
+
+pub async fn subscription_options_handler() -> impl IntoResponse {
+    Json(ApiResponse::success(
+        "订阅选项获取成功",
+        Some(SubscriptionOptionsResponse {
+            groups: groups(),
+            defaults: crate::models::DisasterRules::default(),
+        }),
+    ))
+}
+
 pub async fn unsubscribe_handler(
     State(state): State<AppState>,
     Json(payload): Json<UnsubscribeRequest>,
@@ -212,15 +298,10 @@ impl From<Subscription> for SubscribeResponse {
 }
 
 fn normalize_locations(payload: &SubscribeRequest) -> Result<Vec<SubscriptionLocation>, String> {
-    let mut locations = if payload.locations.is_empty() {
-        vec![SubscriptionLocation {
-            name: payload.location_name.trim().to_string(),
-            latitude: payload.latitude,
-            longitude: payload.longitude,
-        }]
-    } else {
-        payload.locations.clone()
-    };
+    let mut locations = payload.locations.clone();
+    if locations.is_empty() {
+        return Err("请至少添加一个有效监测地点".to_string());
+    }
     if locations.len() > MAX_LOCATIONS {
         return Err(format!("监测地点最多 {MAX_LOCATIONS} 个"));
     }
@@ -231,11 +312,20 @@ fn normalize_locations(payload: &SubscribeRequest) -> Result<Vec<SubscriptionLoc
         return Err("监测地点坐标无效".to_string());
     }
     for location in &mut locations {
-        let trimmed = location.name.trim();
-        if trimmed.chars().count() > MAX_LOCATION_NAME_CHARS {
-            return Err(format!("监测地点名称最多 {MAX_LOCATION_NAME_CHARS} 个字符"));
+        for (label, value) in [
+            ("名称", &mut location.name),
+            ("省级行政区", &mut location.province),
+            ("城市", &mut location.city),
+            ("区县", &mut location.district),
+        ] {
+            let trimmed = value.trim();
+            if trimmed.chars().count() > MAX_LOCATION_NAME_CHARS {
+                return Err(format!(
+                    "监测地点{label}最多 {MAX_LOCATION_NAME_CHARS} 个字符"
+                ));
+            }
+            *value = trimmed.to_string();
         }
-        location.name = trimmed.to_string();
     }
     Ok(locations)
 }
@@ -277,6 +367,14 @@ fn normalize_notify_bands(payload: &SubscribeRequest) -> Result<Vec<Notification
         }
     }
     Ok(bands)
+}
+
+fn resolve_notify_bands(payload: &SubscribeRequest) -> Result<Vec<NotificationBand>, String> {
+    if !payload.disaster_rules.earthquake_warning && payload.notify_bands.is_empty() {
+        Ok(Vec::new())
+    } else {
+        normalize_notify_bands(payload)
+    }
 }
 
 fn validate_bark_id(raw: &str) -> std::result::Result<String, (StatusCode, String)> {
@@ -361,4 +459,53 @@ pub async fn stats_handler(State(state): State<AppState>) -> impl IntoResponse {
 
 pub async fn health_handler() -> impl IntoResponse {
     (StatusCode::OK, Json(ApiResponse::<()>::success("OK", None)))
+}
+
+pub async fn status_handler(State(state): State<AppState>) -> impl IntoResponse {
+    Json(ApiResponse::success(
+        "运行状态获取成功",
+        Some(state.runtime_status.snapshot()),
+    ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn request() -> SubscribeRequest {
+        SubscribeRequest {
+            bark_id: "abc123".to_string(),
+            bark_url: "https://api.day.app".to_string(),
+            locations: vec![SubscriptionLocation {
+                name: "home".to_string(),
+                latitude: 35.0,
+                longitude: 105.0,
+                province: String::new(),
+                city: String::new(),
+                district: String::new(),
+            }],
+            notify_bands: Vec::new(),
+            disaster_rules: crate::models::DisasterRules::default(),
+            source_overrides: std::collections::HashMap::new(),
+        }
+    }
+
+    #[test]
+    fn weather_only_subscription_accepts_empty_intensity_bands() {
+        let mut payload = request();
+        payload.disaster_rules.earthquake_warning = false;
+        assert!(matches!(resolve_notify_bands(&payload), Ok(bands) if bands.is_empty()));
+    }
+
+    #[test]
+    fn earthquake_warning_subscription_requires_intensity_bands() {
+        assert!(resolve_notify_bands(&request()).is_err());
+    }
+
+    #[test]
+    fn administrative_fields_obey_location_length_limit() {
+        let mut payload = request();
+        payload.locations[0].province = "省".repeat(MAX_LOCATION_NAME_CHARS + 1);
+        assert!(normalize_locations(&payload).is_err());
+    }
 }

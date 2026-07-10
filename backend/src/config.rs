@@ -9,14 +9,14 @@ pub struct Config {
     pub server_port: u16,
     pub allowed_origins: Vec<String>,
     pub db_path: String,
-    /// Ordered, normalized Bark server roots. The first entry is only the web UI's
-    /// initial selection; it is never a server-side fallback.
+    /// Ordered, normalized Bark server roots.
     pub bark_url_allowlist: Vec<String>,
     pub bark_sound: Option<String>,
     pub bark_volume: u8,
     pub bark_group: String,
     pub bark_call: bool,
-    pub eew_websocket_url: String,
+    pub wolfx_websocket_url: String,
+    pub fanstudio_websocket_url: String,
     pub reconnect_min_seconds: u64,
     pub reconnect_max_seconds: u64,
     pub push_updates: bool,
@@ -31,6 +31,8 @@ pub struct Config {
     pub max_concurrent_notifications: usize,
     /// HTTP 连接池大小
     pub http_pool_size: usize,
+    pub reverse_geocoding_enabled: bool,
+    pub reverse_geocoding_url: String,
 }
 
 impl Config {
@@ -40,34 +42,49 @@ impl Config {
             server_host: env_string("SERVER_HOST", "0.0.0.0"),
             server_port: env_parse("SERVER_PORT", 30010)?,
             allowed_origins: env_list("ALLOWED_ORIGINS"),
-            db_path: env_string("DB_PATH", "./data/earthquake.db"),
+            db_path: env_string("DB_PATH", "./data/disaster-alert.db"),
             bark_url_allowlist: bark_url_allowlist()?,
             bark_sound: env::var("BARK_SOUND")
                 .ok()
                 .map(|value| value.trim().to_string())
                 .filter(|value| !value.is_empty()),
             bark_volume: env_parse("BARK_VOLUME", 10)?,
-            bark_group: env_string("BARK_GROUP", "地震预警"),
+            bark_group: env_string("BARK_GROUP", "灾害预警"),
             bark_call: env_bool("BARK_CALL", true)?,
-            eew_websocket_url: env_string("EEW_WEBSOCKET_URL", "wss://ws-api.wolfx.jp/all_eew"),
+            wolfx_websocket_url: env_string("WOLFX_WEBSOCKET_URL", "wss://ws-api.wolfx.jp/all_eew"),
+            fanstudio_websocket_url: env_string(
+                "FANSTUDIO_WEBSOCKET_URL",
+                "wss://ws.fanstudio.tech/all",
+            ),
             reconnect_min_seconds: env_parse("RECONNECT_MIN_SECONDS", 1)?,
             reconnect_max_seconds: env_parse("RECONNECT_MAX_SECONDS", 30)?,
             push_updates: env_bool("PUSH_UPDATES", false)?,
             update_min_report_gap: env_parse("UPDATE_MIN_REPORT_GAP", 1)?,
             ignore_training: env_bool("IGNORE_TRAINING", true)?,
-            ignore_cancel: env_bool("IGNORE_CANCEL", true)?,
+            ignore_cancel: env_bool("IGNORE_CANCEL", false)?,
             p_wave_km_s: env_parse("P_WAVE_KM_S", 6.0)?,
             s_wave_km_s: env_parse("S_WAVE_KM_S", 3.5)?,
             stale_origin_seconds: env_parse("STALE_ORIGIN_SECONDS", 600)?,
             dedup_keep_minutes: env_parse("DEDUP_KEEP_MINUTES", 120)?,
             max_concurrent_notifications: env_parse("MAX_CONCURRENT_NOTIFICATIONS", 200)?,
             http_pool_size: env_parse("HTTP_POOL_SIZE", 200)?,
+            reverse_geocoding_enabled: env_bool("REVERSE_GEOCODING_ENABLED", true)?,
+            reverse_geocoding_url: env_string(
+                "REVERSE_GEOCODING_URL",
+                "https://nominatim.openstreetmap.org/reverse",
+            ),
         };
         config.validate()?;
         Ok(config)
     }
 
     fn validate(&self) -> Result<()> {
+        validate_websocket_url("WOLFX_WEBSOCKET_URL", &self.wolfx_websocket_url, None)?;
+        validate_websocket_url(
+            "FANSTUDIO_WEBSOCKET_URL",
+            &self.fanstudio_websocket_url,
+            Some("/all"),
+        )?;
         if self.reconnect_min_seconds == 0 {
             bail!("RECONNECT_MIN_SECONDS must be greater than 0");
         }
@@ -86,6 +103,9 @@ impl Config {
         if self.dedup_keep_minutes == 0 {
             bail!("DEDUP_KEEP_MINUTES must be greater than 0");
         }
+        if self.dedup_keep_minutes.checked_mul(60).is_none() {
+            bail!("DEDUP_KEEP_MINUTES is too large");
+        }
         if self.max_concurrent_notifications == 0 || self.max_concurrent_notifications > 10_000 {
             bail!("MAX_CONCURRENT_NOTIFICATIONS must be in 1..=10000");
         }
@@ -98,8 +118,40 @@ impl Config {
         if self.bark_url_allowlist.is_empty() {
             bail!("BARK_URL_ALLOWLIST must contain at least one URL");
         }
+        validate_http_url("REVERSE_GEOCODING_URL", &self.reverse_geocoding_url)?;
         Ok(())
     }
+}
+
+fn validate_http_url(name: &str, value: &str) -> Result<()> {
+    let parsed = Url::parse(value).with_context(|| format!("invalid {name}"))?;
+    if !matches!(parsed.scheme(), "http" | "https")
+        || parsed.host_str().is_none()
+        || parsed.username() != ""
+        || parsed.password().is_some()
+        || parsed.query().is_some()
+        || parsed.fragment().is_some()
+    {
+        bail!("{name} must be an HTTP(S) URL without credentials, query, or fragment");
+    }
+    Ok(())
+}
+
+fn validate_websocket_url(name: &str, value: &str, required_path: Option<&str>) -> Result<()> {
+    let parsed = Url::parse(value).with_context(|| format!("invalid {name}"))?;
+    if !matches!(parsed.scheme(), "ws" | "wss")
+        || parsed.host_str().is_none()
+        || parsed.username() != ""
+        || parsed.password().is_some()
+        || parsed.query().is_some()
+        || parsed.fragment().is_some()
+    {
+        bail!("{name} must be a WS(S) URL without credentials, query, or fragment");
+    }
+    if required_path.is_some_and(|path| parsed.path() != path) {
+        bail!("{name} must use the /all endpoint");
+    }
+    Ok(())
 }
 
 fn bark_url_allowlist() -> Result<Vec<String>> {

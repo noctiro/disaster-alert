@@ -34,88 +34,37 @@ flowchart LR
 
 ## 技术栈
 
-- **后端**：Rust、Axum、sled、tokio-tungstenite、reqwest（rustls）
-- **前端**：单文件 `web/index.html`，原生 JS、Leaflet + CartoCDN 地图
-- **部署**：后端单二进制内嵌前端；前端可由后端、Cloudflare Worker、Vercel 或任意静态平台托管
+- **服务端**：Rust、Axum、sled、tokio-tungstenite、reqwest（rustls）
+- **Web 界面**：单文件 `web/index.html`，原生 JS、Leaflet + CartoCDN 地图
+- **发布形式**：Web 界面编译进 Rust 二进制，整个应用只需运行一个进程
 
 ## 项目结构
 
 ```text
-backend/              Rust 后端，编译产物为单一二进制
-web/index.html         前端源文件，后端通过 include_str! 内嵌
-deploy/
-  cloudflare-worker/   托管前端 + 反代 API
-  vercel/              rewrite 反代
-  caddy/               反向代理示例
-  nginx/               反向代理示例
-  systemd/             后端守护进程示例
+src/                   Rust 应用源代码
+web/index.html         Web 界面，通过 include_str! 编译进二进制
+Cargo.toml             Rust crate 和构建配置
+.env.example           环境变量示例
 ```
 
 ## 部署
 
-后端必须运行，灾害监听和推送只发生在后端进程；前端可以由后端内嵌、由边缘平台托管，或两者分离部署
-
-### 后端
+灾害监听、订阅 API、Bark 推送和 Web 界面由同一个 Rust 进程提供：
 
 ```bash
-cd backend
 cp .env.example .env
 set -a; . ./.env; set +a
 cargo build --release
-./target/release/disaster-alert-backend
+./target/release/disaster-alert
 ```
 
-默认监听 `0.0.0.0:30010`，前端页面已内嵌在二进制里，浏览器访问 `http://your-server:30010` 即可使用
-
-如果需要常驻，参考 `deploy/systemd/disaster-alert.service`：
-
-```bash
-sudo cp deploy/systemd/disaster-alert.service /etc/systemd/system/
-sudo systemctl enable --now disaster-alert
-```
-
-## 前端托管
-
-### 方式一：后端内嵌（默认）
-
-上面的后端启动方式已经内嵌前端，无需额外配置，所以方式二到方式四只在需要分离托管前端时使用
-
-### 方式二：Cloudflare Worker
-
-`deploy/cloudflare-worker` 托管 `web/` 静态前端，并把 `/api/*`、`/health` 转发到后端
-
-```bash
-cd deploy/cloudflare-worker
-# 编辑 wrangler.toml，把 BACKEND_URL 改为后端地址
-wrangler deploy --env production
-```
-
-### 方式三：Vercel
-
-把 `web/` 作为 Vercel 静态站点根目录，`deploy/vercel/vercel.json` 把 `/api/*` 和 `/health` rewrite 到后端，部署前把 `vercel.json` 里的 `YOUR_BACKEND_HOST` 改成后端地址
-
-### 方式四：Caddy 或 Nginx 反代
-
-- `deploy/caddy/Caddyfile`：整站反代到本机 `127.0.0.1:30010`，自动申请 HTTPS
-- `deploy/caddy/Caddyfile.static`：Caddy 托管 `web/` 静态文件，只反代 `/api/*` 和 `/health`
-- `deploy/nginx/disaster-alert.conf`：把 `/` 反代到本机 `127.0.0.1:30010`
-
-### 任意静态平台 + 跨域后端
-
-把 `web/index.html` 托管到 GitHub Pages、对象存储等任意静态平台，在页面加载前设置后端地址：
-
-```html
-<script>window.DISASTER_API_BASE = "https://api.example.com"</script>
-```
-
-这样前端可以跨域访问独立后端；需要在后端 `ALLOWED_ORIGINS` 中配置前端 Origin 才能跨域访问
+默认监听 `0.0.0.0:30010`，浏览器访问 `http://your-server:30010` 即可使用。生产环境建议将 `SERVER_HOST` 设为 `127.0.0.1`，再由运行环境已有的反向代理提供 HTTPS；进程守护、域名和证书配置也由实际运行环境管理。
 
 ## 配置
 
-后端配置通过环境变量，在 `backend/` 下创建 `.env`，运行前导入或通过系统环境变量配置：
+应用通过环境变量配置。在仓库根目录创建 `.env`，运行前导入或通过进程管理器设置：
 
 ```bash
-cd backend
 cp .env.example .env
 # 编辑 .env
 set -a; . ./.env; set +a

@@ -280,7 +280,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "disaster-alert-backend"
+name = "disaster-alert"
 version = "0.1.0"
 dependencies = [
  "anyhow",

@@ -4,18 +4,17 @@
 
 ## 改动边界
 
-- `backend/` 是核心后端：订阅 API、Wolfx WebSocket、订阅匹配、Bark 推送和内嵌前端
-- `web/index.html` 是唯一前端源文件，后端通过 `include_str!` 内嵌它
-- `deploy/` 只放部署适配器，不承载灾害监听、订阅存储或推送逻辑
+- `src/` 包含完整 Rust 应用：订阅 API、WebSocket 监听、订阅匹配、Bark 推送和 Web 页面路由
+- `web/index.html` 是唯一 Web 界面源文件，通过 `include_str!` 编译进二进制
+- 仓库不维护特定平台的反向代理、进程守护或静态托管配置
 
-后端行为、前端交互、部署反代规则尽量分开改，跨层改动需要说明数据流如何变化
+服务端行为和 Web 交互尽量分开改，跨层改动需要说明数据流如何变化
 
 ## 本地检查
 
-后端开发入口：
+开发入口：
 
 ```bash
-cd backend
 cp .env.example .env
 set -a; . ./.env; set +a
 cargo run
@@ -24,7 +23,6 @@ cargo run
 提交前至少跑：
 
 ```bash
-cd backend
 cargo fmt --check
 cargo check
 cargo test
@@ -38,12 +36,11 @@ cargo clippy --all-targets --all-features
 
 ## Rust 和依赖
 
-`backend/Cargo.toml` 已启用严格 lint，新增代码不要使用 `unwrap()`、`expect()`、`dbg!()`、`println!()`、`todo!()`、`unimplemented!()`，也不要引入 `unsafe`
+`Cargo.toml` 已启用严格 lint，新增代码不要使用 `unwrap()`、`expect()`、`dbg!()`、`println!()`、`todo!()`、`unimplemented!()`，也不要引入 `unsafe`
 
 新增或升级依赖时，默认保持 `default-features = false`，只开启实际用到的 feature，不要启用 `tokio/full`、TLS 双栈或框架默认全量功能来省配置，依赖变更后检查：
 
 ```bash
-cd backend
 cargo tree -e features
 cargo check
 cargo test

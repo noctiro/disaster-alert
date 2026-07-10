@@ -1,26 +1,14 @@
 # Rust 编译产物
 target
-backend/target
-
-# Node.js
-node_modules
-deploy/cloudflare-worker/node_modules
-
-# Cloudflare Worker
-.wrangler
-deploy/cloudflare-worker/.wrangler
 
 # 数据库
-backend/data
-backend/**/*.db
+data
+*.db
 
 # 环境变量
 .env
 .env.*
 !.env.example
-backend/.env
-backend/.env.*
-!backend/.env.example
 
 # 日志
 *.log

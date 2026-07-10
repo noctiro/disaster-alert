@@ -1,6 +1,0 @@
-alert.example.com {
-    encode zstd gzip
-
-    # Run the backend with SERVER_HOST=127.0.0.1 for this deployment, or block port 30010 at the firewall.
-    reverse_proxy 127.0.0.1:30010
-}

@@ -334,6 +334,11 @@
           <input id="bark-id" type="text" autocomplete="off" maxlength="64" required placeholder="例如 JP8S9..." />
         </div>
 
+        <div class="field" id="bark-url-field">
+          <label for="bark-url">Bark URL</label>
+          <select id="bark-url" required disabled></select>
+        </div>
+
         <div class="field">
           <label>监测地点</label>
           <div id="map"></div>
@@ -381,6 +386,8 @@
     const storageKey = "eew_subscription_draft_v2";
     const form = document.querySelector("#subscribe-form");
     const barkInput = document.querySelector("#bark-id");
+    const barkUrlInput = document.querySelector("#bark-url");
+    const barkUrlField = document.querySelector("#bark-url-field");
     const nameInput = document.querySelector("#location-name");
     const latInput = document.querySelector("#latitude");
     const lonInput = document.querySelector("#longitude");
@@ -397,6 +404,7 @@
     let selectedLocations = [];
     let notifyBands = defaultNotifyBands();
     let marker = null;
+    let barkUrls = [];
 
     const map = L.map("map", { zoomControl: false, attributionControl: false }).setView([35, 105], 4);
     L.tileLayer("https://{s}.basemaps.cartocdn.com/light_all/{z}/{x}/{y}{r}.png", { maxZoom: 19 }).addTo(map);
@@ -581,6 +589,7 @@
 
     function persistDraft() {
       const draft = {
+        bark_url: barkUrlInput.value,
         current: { name: nameInput.value.trim(), latitude: Number(latInput.value), longitude: Number(lonInput.value) },
         locations: selectedLocations,
         notify_bands: notifyBands,
@@ -603,6 +612,37 @@
       }
       renderLocations();
       renderNotifyBands();
+      return draft;
+    }
+
+    async function loadBarkUrls(draft) {
+      try {
+        const res = await fetch(api + "/api/bark-urls");
+        const json = await parseApiResponse(res);
+        if (!res.ok || !json.success || !Array.isArray(json.data?.bark_urls) || !json.data.bark_urls.length) {
+          throw new Error(json.message || "没有可用的 Bark URL");
+        }
+        barkUrls = json.data.bark_urls.filter((value) => typeof value === "string" && value);
+        if (!barkUrls.length) throw new Error("没有可用的 Bark URL");
+        barkUrlInput.innerHTML = barkUrls.map((value) => `<option value="${escapeHtml(value)}">${escapeHtml(value)}</option>`).join("");
+        const savedUrl = typeof draft.bark_url === "string" ? draft.bark_url : "";
+        if (savedUrl && barkUrls.includes(savedUrl)) {
+          barkUrlInput.value = savedUrl;
+        } else if (savedUrl) {
+          barkUrlInput.selectedIndex = -1;
+          show("此前选择的 Bark URL 已停用，请重新选择", "error");
+        } else {
+          barkUrlInput.value = barkUrls[0];
+        }
+        barkUrlInput.disabled = false;
+        barkUrlField.style.display = barkUrls.length === 1 ? "none" : "";
+      } catch (error) {
+        barkUrls = [];
+        barkUrlInput.innerHTML = "";
+        barkUrlInput.disabled = true;
+        submit.disabled = true;
+        show(error.message || "无法获取 Bark URL 列表", "error");
+      }
     }
 
     function safeJson(value) {
@@ -665,6 +705,7 @@
     });
 
     [nameInput, latInput, lonInput].forEach((input) => input.addEventListener("input", persistDraft));
+    barkUrlInput.addEventListener("change", persistDraft);
 
     document.querySelector("#add-rule").addEventListener("click", () => {
       if (!commitBands()) return;
@@ -711,8 +752,11 @@
       if (nameError) return show(nameError, "error");
       const barkID = barkInput.value.trim();
       if (!/^[A-Za-z0-9]{1,64}$/.test(barkID)) return show("Bark Key 只能包含字母和数字", "error");
+      const barkUrl = barkUrlInput.value;
+      if (!barkUrls.includes(barkUrl)) return show("请选择有效的 Bark URL", "error");
       const payload = {
         bark_id: barkID,
+        bark_url: barkUrl,
         location_name: locations[0].name,
         latitude: Number(locations[0].latitude),
         longitude: Number(locations[0].longitude),
@@ -779,7 +823,8 @@
       }
     }
 
-    restoreDraft();
+    const draft = restoreDraft();
+    loadBarkUrls(draft);
     refreshStats();
   </script>
 </body>

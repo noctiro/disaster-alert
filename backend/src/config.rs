@@ -1,5 +1,6 @@
 use anyhow::{Context, Result, bail};
 use std::env;
+use url::{Host, Url};
 
 /// 应用配置
 #[derive(Debug, Clone)]
@@ -8,7 +9,9 @@ pub struct Config {
     pub server_port: u16,
     pub allowed_origins: Vec<String>,
     pub db_path: String,
-    pub bark_api_url: String,
+    /// Ordered, normalized Bark server roots. The first entry is only the web UI's
+    /// initial selection; it is never a server-side fallback.
+    pub bark_url_allowlist: Vec<String>,
     pub bark_sound: Option<String>,
     pub bark_volume: u8,
     pub bark_group: String,
@@ -39,7 +42,7 @@ impl Config {
             server_port: env_parse("SERVER_PORT", 30010)?,
             allowed_origins: env_list("ALLOWED_ORIGINS"),
             db_path: env_string("DB_PATH", "./data/earthquake.db"),
-            bark_api_url: env_string("BARK_API_URL", "https://api.day.app"),
+            bark_url_allowlist: bark_url_allowlist()?,
             bark_sound: env::var("BARK_SOUND")
                 .ok()
                 .map(|value| value.trim().to_string())
@@ -97,8 +100,52 @@ impl Config {
         if self.bark_volume > 10 {
             bail!("BARK_VOLUME must be in 0..=10");
         }
+        if self.bark_url_allowlist.is_empty() {
+            bail!("BARK_URL_ALLOWLIST must contain at least one URL");
+        }
         Ok(())
     }
+}
+
+fn bark_url_allowlist() -> Result<Vec<String>> {
+    let raw = env::var("BARK_URL_ALLOWLIST").unwrap_or_else(|_| "https://api.day.app".to_string());
+    let mut urls = Vec::new();
+
+    for entry in raw
+        .split(',')
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        let normalized = normalize_bark_url(entry)
+            .with_context(|| format!("invalid BARK_URL_ALLOWLIST entry {entry:?}"))?;
+        if !urls.contains(&normalized) {
+            urls.push(normalized);
+        }
+    }
+
+    if urls.is_empty() {
+        bail!("BARK_URL_ALLOWLIST must contain at least one URL");
+    }
+    Ok(urls)
+}
+
+pub fn normalize_bark_url(value: &str) -> Result<String> {
+    let parsed = Url::parse(value.trim()).context("must be an absolute URL")?;
+    if parsed.scheme() != "https"
+        || parsed.host_str().is_none()
+        || parsed.username() != ""
+        || parsed.password().is_some()
+        || parsed.port().is_some()
+        || parsed.path() != "/"
+        || parsed.query().is_some()
+        || parsed.fragment().is_some()
+    {
+        bail!("must be an HTTPS origin without credentials, port, path, query, or fragment");
+    }
+    if matches!(parsed.host(), Some(Host::Ipv4(_) | Host::Ipv6(_))) {
+        bail!("IP address hosts are not allowed");
+    }
+    Ok(parsed.origin().ascii_serialization())
 }
 
 fn env_string(name: &str, default: &str) -> String {
@@ -139,5 +186,37 @@ fn env_bool(name: &str, default: bool) -> Result<bool> {
         },
         Err(env::VarError::NotPresent) => Ok(default),
         Err(error) => Err(error).with_context(|| format!("failed to read {name}")),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::normalize_bark_url;
+
+    #[test]
+    fn normalizes_https_origins() -> anyhow::Result<()> {
+        anyhow::ensure!(normalize_bark_url(" https://api.day.app/ ")? == "https://api.day.app");
+        anyhow::ensure!(
+            normalize_bark_url("https://BARK.EXAMPLE.COM")? == "https://bark.example.com"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn rejects_non_origin_and_unsafe_urls() {
+        for value in [
+            "http://api.day.app",
+            "https://api.day.app.evil.example/path",
+            "https://api.day.app@evil.example",
+            "https://127.0.0.1:8443",
+            "https://127.0.0.1",
+            "https://[::1]",
+            "https://api.day.app/path",
+            "https://api.day.app?target=localhost",
+            "https://api.day.app/#fragment",
+            "not-a-url",
+        ] {
+            assert!(normalize_bark_url(value).is_err(), "accepted {value:?}");
+        }
     }
 }

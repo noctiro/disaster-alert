@@ -102,13 +102,15 @@ set -a; . ./.env; set +a
 
 配置值会在启动时校验；数值格式错误、重连下限大于上限、非正波速、无效并发上限等会直接导致服务启动失败。
 
+`BARK_URL_ALLOWLIST` 中每项必须是纯 HTTPS origin，不允许凭据、端口、路径、查询参数或 fragment。配置顺序会原样提供给网页端；网页端首次使用时选择第一项。服务端不会把第一项当作发送失败或历史地址失效时的回退目标。
+
 | 变量 | 默认值 | 说明 |
 | --- | --- | --- |
 | `SERVER_HOST` | `0.0.0.0` | 监听地址 |
 | `SERVER_PORT` | `30010` | 服务端口 |
 | `ALLOWED_ORIGINS` | (空) | 允许跨域访问 API 的前端 Origin，多个值用逗号分隔；空表示不额外开放跨域 |
 | `DB_PATH` | `./data/earthquake.db` | 数据库路径 |
-| `BARK_API_URL` | `https://api.day.app` | Bark 服务器地址 |
+| `BARK_URL_ALLOWLIST` | `https://api.day.app` | 前端可选的 Bark URL 有序白名单，多个值用逗号分隔；第一项仅作为网页端首次选择 |
 | `BARK_SOUND` | (空) | Bark 铃声名称，空表示使用默认 |
 | `BARK_VOLUME` | `10` | Bark 推送音量 (0-10) |
 | `BARK_GROUP` | `地震预警` | Bark 推送分组名 |
@@ -145,6 +147,7 @@ set -a; . ./.env; set +a
 | 方法 | 路径 | 用途 | 成功响应 |
 | --- | --- | --- | --- |
 | `POST` | `/api/subscribe` | 发送 Bark 确认提醒成功后创建或覆盖订阅 | `200` |
+| `GET` | `/api/bark-urls` | 返回网页端可选择的 Bark URL 白名单 | `200` |
 | `DELETE` | `/api/unsubscribe` | 按 Bark ID 删除订阅 | `200` |
 | `GET` | `/api/stats` | 返回订阅总数 | `200` |
 | `GET` | `/health` | 健康检查 | `200` |
@@ -156,7 +159,7 @@ set -a; . ./.env; set +a
 ```json
 {
   "bark_id": "key",
-  "bark_server": "https://api.day.app",
+  "bark_url": "https://api.day.app",
   "location_name": "东京",
   "latitude": 35.6,
   "longitude": 139.6,
@@ -176,7 +179,7 @@ set -a; . ./.env; set +a
 | 字段 | 当前请求要求 | 说明 |
 | --- | --- | --- |
 | `bark_id` | 是 | Bark Key，只允许字母和数字，最长 64 字符 |
-| `bark_server` | 否 | 兼容字段；非空时必须是 HTTPS URL，当前推送服务地址由后端环境变量 `BARK_API_URL` 控制 |
+| `bark_url` | 是 | 必须精确匹配后端 `BARK_URL_ALLOWLIST` 中规范化后的 URL |
 | `location_name` | 是 | 单地点订阅名称，`locations` 为空时使用 |
 | `latitude` / `longitude` | 是 | 单地点坐标，`locations` 为空时使用；当前反序列化仍要求传入这两个字段 |
 | `locations` | 建议传入 | 监测地点列表，最多 3 个，有效坐标范围为纬度 `-90..90`、经度 `-180..180` |
@@ -207,6 +210,7 @@ set -a; . ./.env; set +a
 | 状态码 | 原因 |
 | --- | --- |
 | `400` | Bark ID 为空、过长或包含非字母数字字符 |
+| `400` | Bark URL 无效或不在白名单中 |
 | `400` | 没有有效监测地点 |
 | `400` | 通知规则为空、超过 3 条、级别非法或烈度范围重叠 |
 | `502` | Bark 确认提醒发送失败，订阅未保存 |

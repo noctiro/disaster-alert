@@ -1,9 +1,12 @@
 use crate::db::SubscriptionStore;
 use crate::models::{CommonEarthquakeInfo, Subscription, mask_bark_id};
-use anyhow::Result;
+use anyhow::{Context, Result};
 use serde::Deserialize;
+use std::collections::HashSet;
+use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
-use urlencoding::encode;
+
+const MAX_RESPONSE_BYTES: usize = 16 * 1024;
 
 #[derive(Debug, Clone)]
 pub struct BarkPushConfig {
@@ -25,15 +28,26 @@ pub struct AlertTiming {
 #[derive(Debug, Clone)]
 pub struct AlertRecipient {
     pub bark_id: String,
+    pub bark_url: String,
     pub location_name: String,
     pub latitude: f64,
     pub longitude: f64,
 }
 
+struct BarkMessage<'a> {
+    bark_url: &'a str,
+    bark_id: &'a str,
+    level: &'a str,
+    title: &'a str,
+    subtitle: &'a str,
+    body: &'a str,
+    cleanup_invalid_subscription: bool,
+}
+
 /// Bark 推送客户端，负责重试和无效订阅清理
 #[derive(Clone)]
 pub struct BarkNotifier {
-    api_url: String,
+    allowed_urls: Arc<HashSet<String>>,
     client: reqwest::Client,
     subscription_store: SubscriptionStore,
     push_config: BarkPushConfig,
@@ -41,12 +55,16 @@ pub struct BarkNotifier {
 
 impl BarkNotifier {
     pub fn new(
-        api_url: String,
+        allowed_urls: Vec<String>,
         pool_size: usize,
         subscription_store: SubscriptionStore,
         push_config: BarkPushConfig,
     ) -> Result<Self> {
         push_config.validate()?;
+        anyhow::ensure!(
+            !allowed_urls.is_empty(),
+            "Bark URL allowlist cannot be empty"
+        );
         let client = reqwest::Client::builder()
             .user_agent("EarthquakeAlert/1.0")
             .timeout(Duration::from_secs(3))
@@ -57,20 +75,25 @@ impl BarkNotifier {
             .http2_adaptive_window(true)
             .http2_keep_alive_interval(Duration::from_secs(30))
             .http2_keep_alive_timeout(Duration::from_secs(10))
+            .redirect(reqwest::redirect::Policy::none())
             .build()?;
 
         tracing::info!(
             event = "bark.initialized",
-            api_url = %api_url.trim_end_matches('/'),
+            allowed_url_count = allowed_urls.len(),
             pool_size,
             "bark.initialized"
         );
         Ok(Self {
-            api_url: api_url.trim_end_matches('/').to_string(),
+            allowed_urls: Arc::new(allowed_urls.into_iter().collect()),
             client,
             subscription_store,
             push_config,
         })
+    }
+
+    pub fn allows_bark_url(&self, bark_url: &str) -> bool {
+        self.allowed_urls.contains(bark_url)
     }
 
     pub async fn send_earthquake_alert(
@@ -155,8 +178,16 @@ impl BarkNotifier {
         ]);
         let body = lines.join("\n");
 
-        self.send_notification(&recipient.bark_id, level, &title, &subtitle, &body)
-            .await
+        self.send_notification(BarkMessage {
+            bark_url: &recipient.bark_url,
+            bark_id: &recipient.bark_id,
+            level,
+            title: &title,
+            subtitle: &subtitle,
+            body: &body,
+            cleanup_invalid_subscription: true,
+        })
+        .await
     }
 
     pub async fn send_subscription_confirm(&self, subscription: &Subscription) -> Result<()> {
@@ -182,67 +213,70 @@ impl BarkNotifier {
         }
         let body = lines.join("\n");
 
-        self.send_notification(&subscription.bark_id, "active", title, &subtitle, &body)
-            .await
+        self.send_notification(BarkMessage {
+            bark_url: &subscription.bark_url,
+            bark_id: &subscription.bark_id,
+            level: "active",
+            title,
+            subtitle: &subtitle,
+            body: &body,
+            cleanup_invalid_subscription: false,
+        })
+        .await
     }
 
-    async fn send_notification(
-        &self,
-        bark_id: &str,
-        level: &str,
-        title: &str,
-        subtitle: &str,
-        body: &str,
-    ) -> Result<()> {
+    async fn send_notification(&self, message: BarkMessage<'_>) -> Result<()> {
+        let BarkMessage {
+            bark_url,
+            bark_id,
+            level,
+            title,
+            subtitle,
+            body,
+            cleanup_invalid_subscription,
+        } = message;
         let level = match level.trim().to_ascii_lowercase().as_str() {
             "passive" => "passive",
             "active" => "active",
             "critical" => "critical",
             _ => "critical",
         };
-        let mut params = vec![("group", self.push_config.group.as_str()), ("level", level)];
-        let volume = self.push_config.volume.to_string();
-        if self.push_config.volume > 0 && level != "passive" {
-            params.push(("volume", volume.as_str()));
-        }
-        if self.push_config.call && level != "passive" {
-            params.push(("call", "1"));
-        }
-        if let Some(sound) = &self.push_config.sound
-            && level != "passive"
-        {
-            params.push(("sound", sound.as_str()));
-        }
-
-        let query = params
-            .iter()
-            .map(|(key, value)| format!("{}={}", encode(key), encode(value)))
-            .collect::<Vec<_>>()
-            .join("&");
-
-        // bark_id and alert content travel in the URL path/query and can appear in proxy logs.
-        // urlencoding::encode percent-encodes path metacharacters such as '/'.
-        let url = format!(
-            "{}/{}/{}/{}/{}?{}",
-            self.api_url,
-            encode(bark_id),
-            encode(title),
-            encode(subtitle),
-            encode(body),
-            query
+        anyhow::ensure!(
+            self.allows_bark_url(bark_url),
+            "订阅使用的 Bark URL 已被管理员停用，请重新配置"
         );
+        let url = format!("{bark_url}/push");
+        let mut payload = serde_json::json!({
+            "device_key": bark_id,
+            "title": title,
+            "subtitle": subtitle,
+            "body": body,
+            "group": self.push_config.group,
+            "level": level,
+        });
+        if level != "passive" {
+            if self.push_config.volume > 0 {
+                payload["volume"] = serde_json::json!(self.push_config.volume);
+            }
+            if self.push_config.call {
+                payload["call"] = serde_json::json!(1);
+            }
+            if let Some(sound) = &self.push_config.sound {
+                payload["sound"] = serde_json::json!(sound);
+            }
+        }
 
         let mut retries = 0;
         let max_retries = 2;
 
         loop {
-            match self.client.get(&url).send().await {
+            match self.client.post(&url).json(&payload).send().await {
                 Ok(response) => {
                     let status = response.status();
                     let status_code = status.as_u16();
 
                     if status.is_success() {
-                        let body_text = response.text().await.unwrap_or_default();
+                        let body_text = limited_response_text(response).await?;
                         if bark_response_succeeded(&body_text) {
                             tracing::debug!(
                                 event = "bark.push_succeeded",
@@ -257,20 +291,20 @@ impl BarkNotifier {
                             event = "bark.push_rejected",
                             bark_id = %mask_bark_id(bark_id),
                             status = status_code,
-                            response_body = %body_text,
                             cleanup = false,
                             "bark.push_rejected"
                         );
-                        return Err(anyhow::anyhow!("Bark 推送失败: {}", body_text));
+                        return Err(anyhow::anyhow!("Bark 服务拒绝了推送"));
                     } else {
-                        let error_text = response.text().await.unwrap_or_default();
+                        let _error_text = limited_response_text(response).await?;
 
-                        if status_code == 400 || status_code == 404 {
+                        if (status_code == 400 || status_code == 404)
+                            && cleanup_invalid_subscription
+                        {
                             tracing::warn!(
                                 event = "bark.push_rejected",
                                 bark_id = %mask_bark_id(bark_id),
                                 status = status_code,
-                                response_body = %error_text,
                                 cleanup = true,
                                 "bark.push_rejected"
                             );
@@ -305,7 +339,21 @@ impl BarkNotifier {
                             ));
                         }
 
-                        if retries < max_retries {
+                        if status.is_client_error() {
+                            tracing::warn!(
+                                event = "bark.push_rejected",
+                                bark_id = %mask_bark_id(bark_id),
+                                status = status_code,
+                                cleanup = false,
+                                "bark.push_rejected"
+                            );
+                            return Err(anyhow::anyhow!(
+                                "Bark 服务拒绝了推送 (HTTP {})",
+                                status_code
+                            ));
+                        }
+
+                        if status.is_server_error() && retries < max_retries {
                             retries += 1;
                             tracing::warn!(
                                 event = "bark.push_retrying",
@@ -313,7 +361,6 @@ impl BarkNotifier {
                                 retry = retries,
                                 max_retries,
                                 status = status.as_u16(),
-                                response_body = %error_text,
                                 "bark.push_retrying"
                             );
                             tokio::time::sleep(backoff_delay(retries)).await;
@@ -324,7 +371,6 @@ impl BarkNotifier {
                             event = "bark.push_failed",
                             bark_id = %mask_bark_id(bark_id),
                             status = status.as_u16(),
-                            response_body = %error_text,
                             "bark.push_failed"
                         );
                         return Err(anyhow::anyhow!("Bark 推送失败: {}", status));
@@ -380,6 +426,27 @@ fn bark_response_succeeded(body: &str) -> bool {
         Ok(response) => response.code == Some(200) || response.success == Some(true),
         Err(_) => false,
     }
+}
+
+async fn limited_response_text(mut response: reqwest::Response) -> Result<String> {
+    if response
+        .content_length()
+        .is_some_and(|length| length > MAX_RESPONSE_BYTES as u64)
+    {
+        anyhow::bail!("Bark response exceeded size limit");
+    }
+    let mut body = Vec::new();
+    while let Some(chunk) = response
+        .chunk()
+        .await
+        .context("failed to read Bark response")?
+    {
+        if body.len().saturating_add(chunk.len()) > MAX_RESPONSE_BYTES {
+            anyhow::bail!("Bark response exceeded size limit");
+        }
+        body.extend_from_slice(&chunk);
+    }
+    Ok(String::from_utf8_lossy(&body).into_owned())
 }
 
 fn backoff_delay(retry: u32) -> Duration {

@@ -1,3 +1,4 @@
+use crate::config::normalize_bark_url;
 use crate::db::{Database, StoreErrorKind, SubscriptionStore};
 use crate::models::{
     ApiResponse, NotificationBand, SubscribeRequest, Subscription, SubscriptionLocation,
@@ -7,7 +8,6 @@ use crate::services::BarkNotifier;
 use crate::utils::distance;
 use axum::{Json, extract::State, http::StatusCode, response::IntoResponse};
 use serde::Serialize;
-use url::Url;
 
 const MAX_LOCATIONS: usize = 3;
 const MAX_LOCATION_NAME_CHARS: usize = 80;
@@ -18,6 +18,7 @@ const MAX_BAND_LABEL_CHARS: usize = 32;
 pub struct AppState {
     pub db: Database,
     pub bark_notifier: BarkNotifier,
+    pub bark_urls: Vec<String>,
 }
 
 pub async fn subscribe_handler(
@@ -34,15 +35,23 @@ pub async fn subscribe_handler(
         }
     };
 
-    let bark_server = match normalize_bark_server(&payload.bark_server) {
+    let bark_url = match normalize_bark_url(&payload.bark_url) {
         Ok(value) => value,
-        Err(message) => {
+        Err(_error) => {
             return (
                 StatusCode::BAD_REQUEST,
-                Json(ApiResponse::<SubscribeResponse>::error(message)),
+                Json(ApiResponse::<SubscribeResponse>::error("Bark URL 无效")),
             );
         }
     };
+    if !state.bark_notifier.allows_bark_url(&bark_url) {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(ApiResponse::<SubscribeResponse>::error(
+                "Bark URL 不在允许列表中",
+            )),
+        );
+    }
 
     let locations = match normalize_locations(&payload) {
         Ok(locations) => locations,
@@ -73,7 +82,7 @@ pub async fn subscribe_handler(
         }
     };
     let mut subscription = Subscription::new(bark_id, primary.latitude, primary.longitude);
-    subscription.bark_server = bark_server;
+    subscription.bark_url = bark_url;
     subscription.location_name = primary.name;
     subscription.locations = locations;
     subscription.notify_bands = notify_bands;
@@ -270,22 +279,6 @@ fn normalize_notify_bands(payload: &SubscribeRequest) -> Result<Vec<Notification
     Ok(bands)
 }
 
-fn normalize_bark_server(value: &str) -> Result<String, String> {
-    let trimmed = value.trim().trim_end_matches('/');
-    if trimmed.is_empty() {
-        return Ok(String::new());
-    }
-
-    let parsed = Url::parse(trimmed).map_err(|_error| "Bark 服务器地址无效".to_string())?;
-    if parsed.scheme() != "https" {
-        return Err("Bark 服务器必须使用 HTTPS".to_string());
-    }
-    if parsed.host_str().is_none() || parsed.username() != "" || parsed.password().is_some() {
-        return Err("Bark 服务器地址无效".to_string());
-    }
-    Ok(trimmed.to_string())
-}
-
 fn validate_bark_id(raw: &str) -> std::result::Result<String, (StatusCode, String)> {
     let trimmed = raw.trim();
     if trimmed.is_empty() {
@@ -297,7 +290,7 @@ fn validate_bark_id(raw: &str) -> std::result::Result<String, (StatusCode, Strin
             "Bark ID 过长（最大64字符）".to_string(),
         ));
     }
-    if !trimmed.chars().all(|c| c.is_alphanumeric()) {
+    if !trimmed.bytes().all(|byte| byte.is_ascii_alphanumeric()) {
         return Err((
             StatusCode::BAD_REQUEST,
             "Bark ID 只能包含字母、数字".to_string(),
@@ -318,6 +311,20 @@ where
 #[derive(Serialize)]
 pub struct StatsResponse {
     pub total_subscriptions: usize,
+}
+
+#[derive(Serialize)]
+pub struct BarkUrlsResponse {
+    pub bark_urls: Vec<String>,
+}
+
+pub async fn bark_urls_handler(State(state): State<AppState>) -> impl IntoResponse {
+    Json(ApiResponse::success(
+        "Bark URL 列表获取成功",
+        Some(BarkUrlsResponse {
+            bark_urls: state.bark_urls,
+        }),
+    ))
 }
 
 pub async fn stats_handler(State(state): State<AppState>) -> impl IntoResponse {

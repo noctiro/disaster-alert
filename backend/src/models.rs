@@ -4,8 +4,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Subscription {
     pub bark_id: String,
-    #[serde(default)]
-    pub bark_server: String,
+    #[serde(default, alias = "bark_server")]
+    pub bark_url: String,
     #[serde(default)]
     pub location_name: String,
     pub latitude: f64,
@@ -43,7 +43,7 @@ impl Subscription {
 
         Self {
             bark_id,
-            bark_server: String::new(),
+            bark_url: String::new(),
             location_name: String::new(),
             latitude,
             longitude,
@@ -93,7 +93,7 @@ impl Subscription {
 pub struct SubscribeRequest {
     pub bark_id: String,
     #[serde(default)]
-    pub bark_server: String,
+    pub bark_url: String,
     #[serde(default)]
     pub location_name: String,
     pub latitude: f64,

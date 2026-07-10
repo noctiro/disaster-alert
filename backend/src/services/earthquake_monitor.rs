@@ -516,6 +516,7 @@ fn evaluate_subscription(
             best = Some(PushTarget {
                 recipient: AlertRecipient {
                     bark_id: subscription.bark_id.clone(),
+                    bark_url: subscription.bark_url.clone(),
                     location_name: location.name,
                     latitude: location.latitude,
                     longitude: location.longitude,

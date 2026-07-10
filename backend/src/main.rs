@@ -14,7 +14,8 @@ use axum::{
 use config::Config;
 use db::Database;
 use routes::{
-    AppState, health_handler, index_handler, stats_handler, subscribe_handler, unsubscribe_handler,
+    AppState, bark_urls_handler, health_handler, index_handler, stats_handler, subscribe_handler,
+    unsubscribe_handler,
 };
 use services::{BarkNotifier, BarkPushConfig, EarthquakeMonitor};
 use std::net::SocketAddr;
@@ -53,7 +54,7 @@ async fn main() -> Result<()> {
         call: config.bark_call,
     };
     let bark_notifier = BarkNotifier::new(
-        config.bark_api_url.clone(),
+        config.bark_url_allowlist.clone(),
         config.http_pool_size,
         db.subscriptions(),
         push_config,
@@ -62,6 +63,7 @@ async fn main() -> Result<()> {
     let state = AppState {
         db: db.clone(),
         bark_notifier: bark_notifier.clone(),
+        bark_urls: config.bark_url_allowlist.clone(),
     };
 
     let cors = build_cors_layer(&config)?;
@@ -71,6 +73,7 @@ async fn main() -> Result<()> {
         .route("/index.html", get(index_handler))
         .route("/health", get(health_handler))
         .route("/api/subscribe", post(subscribe_handler))
+        .route("/api/bark-urls", get(bark_urls_handler))
         .route("/api/unsubscribe", delete(unsubscribe_handler))
         .route("/api/stats", get(stats_handler))
         .layer(cors)

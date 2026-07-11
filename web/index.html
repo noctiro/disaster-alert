@@ -641,14 +641,14 @@
           </div>
         </div>
         <div class="form-actions">
-          <div class="form-actions-note">保存会覆盖该 Bark Key 已有的订阅配置。</div>
+          <div class="form-actions-note">保存会覆盖同一 Bark 服务与 Key 的已有订阅配置。</div>
           <button class="primary" id="submit" type="submit">保存/覆盖订阅</button>
         </div>
         <details class="config-disclosure danger-zone">
           <summary>订阅管理</summary>
           <div class="config-disclosure-body">
             <div class="danger-zone-row">
-              <div class="danger-zone-note">取消后将删除该 Bark Key 的全部灾害预警配置。</div>
+              <div class="danger-zone-note">取消后将删除当前 Bark 服务与 Key 的全部灾害预警配置。</div>
               <button class="danger" id="unsubscribe" type="button">取消订阅</button>
             </div>
           </div>
@@ -695,9 +695,9 @@
     const expandedDisasterCategories = new Set();
     let marker = null;
     let barkUrls = [];
-    let optionGroups = [];
-    let disasterRules = defaultDisasterRules();
-    let sourceOverrides = {};
+    let optionCategories = [];
+    let alertRules = {};
+    let disabledAlertRules = {};
     let editingLocationIndex = null;
     let configurationReady = false;
     let subscriptionRequestInFlight = false;
@@ -1015,37 +1015,73 @@
       return [
         { min: 1, max: 1, level: "passive", label: "低烈度" },
         { min: 2, max: 2, level: "active", label: "中等烈度" },
-        { min: 3, max: 99, level: "critical", label: "高烈度" },
+        { min: 3, max: 7, level: "critical", label: "高烈度" },
       ];
     }
 
-    function defaultDisasterRules() {
-      return {
-        earthquake_warning: true, earthquake_report: true, weather_warning: true,
-        tsunami: true, typhoon: true, min_earthquake_magnitude: 4.5,
-        weather_radius_km: 100, min_weather_level: 2, min_tsunami_level: 2,
-        typhoon_radius_km: 300,
+    function cloneJson(value) {
+      return JSON.parse(JSON.stringify(value));
+    }
+
+    function sourceIds(category) {
+      const option = optionCategories.find((item) => item.id === category);
+      return (option?.source_groups || []).flatMap((group) => group.sources.map((source) => source.id));
+    }
+
+    function sourceEnabled(category, source) {
+      const selection = alertRules[category]?.sources;
+      return selection?.mode === "all"
+        || selection?.mode === "include" && Array.isArray(selection.ids) && selection.ids.includes(source);
+    }
+
+    function setSelectedSources(category, ids) {
+      const allIds = sourceIds(category);
+      const selected = allIds.filter((id) => Array.isArray(ids) && ids.includes(id));
+      alertRules[category].sources = selected.length === allIds.length
+        ? { mode: "all" }
+        : { mode: "include", ids: selected };
+    }
+
+    function sanitizeAlertRule(category, candidate) {
+      const fallback = cloneJson(category.default_alert);
+      if (!candidate || typeof candidate !== "object" || candidate.category !== category.id) return fallback;
+      const knownSources = new Set(sourceIds(category.id));
+      const selection = candidate.sources;
+      if (selection?.mode === "all") {
+        fallback.sources = { mode: "all" };
+      } else if (selection?.mode === "include" && Array.isArray(selection.ids)) {
+        fallback.sources = {
+          mode: "include",
+          ids: [...new Set(selection.ids.filter((id) => typeof id === "string" && knownSources.has(id)))],
+        };
+      }
+      const finiteNumber = (value, defaultValue) => {
+        const number = Number(value);
+        return Number.isFinite(number) ? number : defaultValue;
       };
+      if (category.id === "earthquake_warning") {
+        fallback.estimated_intensity_bands = normalizeBands(candidate.estimated_intensity_bands)
+          .map((band) => ({ min: band.min, max: band.max, interruption_level: band.level }));
+      } else if (category.id === "earthquake_report") {
+        fallback.min_magnitude = finiteNumber(candidate.min_magnitude, fallback.min_magnitude);
+      } else if (category.id === "weather_warning") {
+        fallback.min_severity = finiteNumber(candidate.min_severity, fallback.min_severity);
+        fallback.fallback_radius_km = finiteNumber(candidate.fallback_radius_km, fallback.fallback_radius_km);
+      } else if (category.id === "tsunami") {
+        fallback.min_severity = finiteNumber(candidate.min_severity, fallback.min_severity);
+      } else if (category.id === "typhoon") {
+        fallback.max_center_distance_km = finiteNumber(candidate.max_center_distance_km, fallback.max_center_distance_km);
+      }
+      return fallback;
     }
-
-    function sourceEnabled(source) {
-      return sourceOverrides[source] !== false;
-    }
-
-    const categoryLabels = {
-      earthquake_warning: "地震预警",
-      earthquake_report: "地震速报",
-      weather_warning: "气象预警",
-      tsunami: "海啸预警",
-      typhoon: "台风信息",
-    };
 
     function thresholdFields(category, disabled) {
       const state = disabled ? "disabled" : "";
-      if (category === "earthquake_report") return `<label>最低震级<input data-rule="min_earthquake_magnitude" type="number" min="0" max="10" step="0.1" value="${escapeHtml(disasterRules.min_earthquake_magnitude)}" ${state}></label>`;
-      if (category === "weather_warning") return `<label>通知半径 (km)<input data-rule="weather_radius_km" type="number" min="1" max="2000" value="${escapeHtml(disasterRules.weather_radius_km)}" ${state}></label><label>最低级别<select data-rule="min_weather_level" ${state}>${levelOptions(disasterRules.min_weather_level)}</select></label>`;
-      if (category === "tsunami") return `<label>最低级别<select data-rule="min_tsunami_level" ${state}>${levelOptions(disasterRules.min_tsunami_level)}</select></label>`;
-      if (category === "typhoon") return `<label>中心距离 (km)<input data-rule="typhoon_radius_km" type="number" min="1" max="3000" value="${escapeHtml(disasterRules.typhoon_radius_km)}" ${state}></label>`;
+      const alert = alertRules[category] || optionCategories.find((item) => item.id === category)?.default_alert || {};
+      if (category === "earthquake_report") return `<label>最低震级<input data-rule="min_magnitude" type="number" min="0" max="10" step="0.1" value="${escapeHtml(alert.min_magnitude)}" ${state}></label>`;
+      if (category === "weather_warning") return `<label>回退半径 (km)<input data-rule="fallback_radius_km" type="number" min="1" max="2000" value="${escapeHtml(alert.fallback_radius_km)}" ${state}></label><label>最低严重度<select data-rule="min_severity" ${state}>${levelOptions(alert.min_severity)}</select></label>`;
+      if (category === "tsunami") return `<label>最低严重度<select data-rule="min_severity" ${state}>${levelOptions(alert.min_severity)}</select></label>`;
+      if (category === "typhoon") return `<label>中心最大距离 (km)<input data-rule="max_center_distance_km" type="number" min="1" max="3000" value="${escapeHtml(alert.max_center_distance_km)}" ${state}></label>`;
       return "";
     }
 
@@ -1054,19 +1090,10 @@
     }
 
     function renderDisasterGroups() {
-      const categories = [];
-      for (const group of optionGroups) {
-        let category = categories.find((item) => item.id === group.category);
-        if (!category) {
-          category = { id: group.category, label: categoryLabels[group.category] || group.label, groups: [] };
-          categories.push(category);
-        }
-        category.groups.push(group);
-      }
-      disasterGroupsEl.innerHTML = categories.map((category) => {
-        const disabled = !disasterRules[category.id];
-        const sourceCount = category.groups.reduce((total, group) => total + group.sources.length, 0);
-        const enabledCount = category.groups.reduce((total, group) => total + group.sources.filter((source) => sourceEnabled(source.id)).length, 0);
+      disasterGroupsEl.innerHTML = optionCategories.map((category) => {
+        const disabled = !alertRules[category.id];
+        const sourceCount = category.source_groups.reduce((total, group) => total + group.sources.length, 0);
+        const enabledCount = category.source_groups.reduce((total, group) => total + group.sources.filter((source) => sourceEnabled(category.id, source.id)).length, 0);
         const expanded = expandedDisasterCategories.has(category.id);
         const filters = thresholdFields(category.id, disabled);
         return `
@@ -1085,7 +1112,7 @@
             </label>
           </div>
           <div class="disaster-detail" ${expanded ? "" : "hidden"}>
-            ${category.groups.map((group) => `
+            ${category.source_groups.map((group) => `
               <div class="source-section" data-source-group="${escapeHtml(group.id)}">
                 <div class="source-section-header">
                   <span class="source-section-title">${escapeHtml(group.label)}</span>
@@ -1094,7 +1121,7 @@
                     <button type="button" data-source-action="disable" ${disabled ? "disabled" : ""}>清空</button>
                   </span>
                 </div>
-                <div class="source-list">${group.sources.map((source) => `<label class="source-row"><input class="source-toggle" data-source="${escapeHtml(source.id)}" type="checkbox" ${sourceEnabled(source.id) ? "checked" : ""} ${disabled ? "disabled" : ""}><span>${escapeHtml(source.label)}</span></label>`).join("")}</div>
+                <div class="source-list">${group.sources.map((source) => `<label class="source-row"><input class="source-toggle" data-source="${escapeHtml(source.id)}" type="checkbox" ${sourceEnabled(category.id, source.id) ? "checked" : ""} ${disabled ? "disabled" : ""}><span>${escapeHtml(source.label)}</span></label>`).join("")}</div>
               </div>`).join("")}
             ${filters ? `<div class="filter-section"><div class="filter-title">筛选条件</div><div class="rule-grid">${filters}</div></div>` : ""}
           </div>
@@ -1104,7 +1131,7 @@
     }
 
     function updateNotifyBandAvailability() {
-      const disabled = !disasterRules.earthquake_warning;
+      const disabled = !alertRules.earthquake_warning;
       earthquakeNotifyCard.classList.toggle("is-disabled", disabled);
       earthquakeNotifyCard.querySelectorAll("input, select, button").forEach((control) => { control.disabled = disabled; });
       if (disabled) setNotifyWarning("");
@@ -1114,39 +1141,36 @@
       const res = await fetch(api + "/api/subscription-options");
       const json = await parseApiResponse(res);
       if (generation !== initializationGeneration) return;
-      if (!res.ok || !json.success || !Array.isArray(json.data?.groups)) throw new Error(json.message || "无法获取灾害来源");
-      optionGroups = json.data.groups;
-      disasterRules = { ...defaultDisasterRules(), ...(json.data.defaults || {}), ...(draft.disaster_rules || {}) };
-      const knownSources = new Set(optionGroups.flatMap((group) => group.sources.map((source) => source.id)));
-      sourceOverrides = Object.fromEntries(Object.entries(draft.source_overrides || {}).filter(([source, enabled]) => knownSources.has(source) && typeof enabled === "boolean"));
+      if (!res.ok || !json.success || !Array.isArray(json.data?.categories)) throw new Error(json.message || "无法获取灾害来源");
+      optionCategories = json.data.categories;
+      const configured = Array.isArray(draft.alerts) ? draft.alerts : optionCategories.map((category) => category.default_alert);
+      const configuredByCategory = new Map(configured
+        .filter((alert) => alert && typeof alert === "object" && typeof alert.category === "string")
+        .map((alert) => [alert.category, alert]));
+      alertRules = Object.fromEntries(optionCategories
+        .filter((category) => configuredByCategory.has(category.id))
+        .map((category) => [category.id, sanitizeAlertRule(category, configuredByCategory.get(category.id))]));
+      disabledAlertRules = {};
+      const earthquakeBands = alertRules.earthquake_warning?.estimated_intensity_bands;
+      notifyBands = normalizeBands(earthquakeBands || defaultNotifyBands());
+      renderNotifyBands();
       renderDisasterGroups();
     }
 
-    function validateDisasterRules(rules) {
-      if (!["earthquake_warning", "earthquake_report", "weather_warning", "tsunami", "typhoon"].some((category) => rules[category])) return "请至少启用一种灾害类别";
-      const magnitude = Number(rules.min_earthquake_magnitude);
-      const weatherRadius = Number(rules.weather_radius_km);
-      const typhoonRadius = Number(rules.typhoon_radius_km);
-      const weatherLevel = Number(rules.min_weather_level);
-      const tsunamiLevel = Number(rules.min_tsunami_level);
+    function validateAlertRules() {
+      const alerts = Object.values(alertRules);
+      if (!alerts.length) return "请至少启用一种灾害类别";
+      const magnitude = Number(alertRules.earthquake_report?.min_magnitude ?? 0);
+      const weatherRadius = Number(alertRules.weather_warning?.fallback_radius_km ?? 1);
+      const typhoonRadius = Number(alertRules.typhoon?.max_center_distance_km ?? 1);
+      const weatherLevel = Number(alertRules.weather_warning?.min_severity ?? 1);
+      const tsunamiLevel = Number(alertRules.tsunami?.min_severity ?? 1);
       if (!Number.isFinite(magnitude) || magnitude < 0 || magnitude > 10) return "最低震级必须在 0 到 10 之间";
-      if (!Number.isFinite(weatherRadius) || weatherRadius < 1 || weatherRadius > 2000) return "气象预警半径必须在 1 到 2000 公里之间";
-      if (!Number.isFinite(typhoonRadius) || typhoonRadius < 1 || typhoonRadius > 3000) return "台风通知半径必须在 1 到 3000 公里之间";
+      if (!Number.isFinite(weatherRadius) || weatherRadius < 1 || weatherRadius > 2000) return "气象预警回退半径必须在 1 到 2000 公里之间";
+      if (!Number.isFinite(typhoonRadius) || typhoonRadius < 1 || typhoonRadius > 3000) return "台风中心最大距离必须在 1 到 3000 公里之间";
       if (![1, 2, 3, 4].includes(weatherLevel) || ![1, 2, 3, 4].includes(tsunamiLevel)) return "灾害最低级别必须在 1 到 4 之间";
-      return "";
-    }
-
-    function validateSourceSelection() {
-      const categories = new Map();
-      for (const group of optionGroups) {
-        const sources = categories.get(group.category) || [];
-        sources.push(...group.sources);
-        categories.set(group.category, sources);
-      }
-      for (const [category, sources] of categories) {
-        if (disasterRules[category] && !sources.some((source) => sourceEnabled(source.id))) {
-          return `${categoryLabels[category] || category}请至少启用一个来源`;
-        }
+      for (const category of optionCategories) {
+        if (alertRules[category.id]?.sources?.mode === "include" && !alertRules[category.id].sources.ids.length) return `${category.label}请至少启用一个来源`;
       }
       return "";
     }
@@ -1159,11 +1183,12 @@
       const result = [];
       const usedLevels = new Set();
       for (const band of bands || []) {
-        const level = notifyLevelOrder.includes(String(band.level || "").toLowerCase()) ? String(band.level).toLowerCase() : "passive";
+        const levelValue = band.interruption_level ?? band.level;
+        const level = notifyLevelOrder.includes(String(levelValue || "").toLowerCase()) ? String(levelValue).toLowerCase() : "passive";
         if (usedLevels.has(level)) continue;
         usedLevels.add(level);
         let min = clampInt(band.min, 0, 7, 0);
-        let max = String(band.max).includes("+") ? 99 : clampInt(band.max, 0, 99, level === "critical" ? 99 : min);
+        let max = clampInt(band.max, 0, 7, level === "critical" ? 7 : min);
         result.push({ min, max, level, label: String(band.label || levelLabel(level)).trim() });
         if (result.length >= 3) break;
       }
@@ -1196,8 +1221,8 @@
         if (!notifyLevelOrder.includes(band.level)) return "通知级别无效";
         if (levels.has(band.level)) return "每个通知级别只能添加一条规则";
         levels.add(band.level);
-        if (!Number.isInteger(band.min) || !Number.isInteger(band.max) || band.min > band.max || band.min < 0 || band.max > 99) return "烈度范围无效";
-        if (band.level === "critical" && band.max < 7) return "Critical 规则上限必须覆盖 7+";
+        if (!Number.isInteger(band.min) || !Number.isInteger(band.max) || band.min > band.max || band.min < 0 || band.max > 7) return "烈度范围无效";
+        if (band.level === "critical" && band.max !== 7) return "Critical 规则上限必须覆盖烈度 7";
         if (String(band.label || "").trim().length > 32) return "通知级别标签最多 32 个字符";
         for (let value = band.min; value <= band.max; value++) {
           if (used.has(value)) return "烈度范围不能重叠";
@@ -1214,7 +1239,7 @@
           <div class="range-fields">
             <input class="band-min" type="number" min="0" max="7" step="1" value="${escapeHtml(band.min)}" aria-label="起始烈度">
             <span>到</span>
-            <input class="band-max" type="text" inputmode="numeric" value="${escapeHtml(band.max >= 99 ? "7+" : band.max)}" aria-label="最高烈度">
+            <input class="band-max" type="number" min="0" max="7" step="1" value="${escapeHtml(band.max)}" aria-label="最高烈度">
           </div>
           <select class="band-select level-${escapeHtml(band.level)}" aria-label="通知级别">
             ${notifyLevelOrder.map((level) => `<option value="${escapeHtml(level)}" ${level === band.level ? "selected" : ""}>${escapeHtml(levelLabel(level))}</option>`).join("")}
@@ -1229,8 +1254,7 @@
       notifyBandsEl.querySelectorAll(".rule-row").forEach((row) => {
         const level = row.querySelector(".band-select").value;
         const min = Number(row.querySelector(".band-min").value);
-        const maxText = row.querySelector(".band-max").value.trim();
-        const max = maxText === "7+" ? 99 : Number(maxText);
+        const max = Number(row.querySelector(".band-max").value);
         bands.push({ min, max, level, label: levelLabel(level) });
       });
       return bands;
@@ -1242,9 +1266,21 @@
       setNotifyWarning(error || "");
       if (error) return false;
       notifyBands = bands.sort((left, right) => left.min - right.min);
+      if (alertRules.earthquake_warning) {
+        alertRules.earthquake_warning.estimated_intensity_bands = notifyBands.map((band) => ({
+          min: band.min, max: band.max, interruption_level: band.level,
+        }));
+      }
       renderNotifyBands();
       if (showWarning && !error) persistDraft();
       return true;
+    }
+
+    function syncNotifyBands() {
+      if (!alertRules.earthquake_warning) return;
+      alertRules.earthquake_warning.estimated_intensity_bands = notifyBands.map((band) => ({
+        min: band.min, max: band.max, interruption_level: band.level,
+      }));
     }
 
     function persistDraft() {
@@ -1254,20 +1290,32 @@
           name: nameInput.value.trim(), latitude: Number(latInput.value), longitude: Number(lonInput.value),
           province: provinceInput.value.trim(), city: cityInput.value.trim(), district: districtInput.value.trim(),
         },
-        locations: selectedLocations,
-        notify_bands: notifyBands,
-        disaster_rules: disasterRules,
-        source_overrides: sourceOverrides,
+        targets: selectedLocations.map((location) => ({
+          label: location.name,
+          point: { latitude: location.latitude, longitude: location.longitude },
+          region: { province: location.province, city: location.city, district: location.district },
+        })),
+        alerts: Object.values(alertRules),
       };
       localStorage.setItem(storageKey, JSON.stringify(draft));
     }
 
     function restoreDraft() {
       const draft = safeJson(localStorage.getItem(storageKey)) || {};
-      disasterRules = { ...defaultDisasterRules(), ...(draft.disaster_rules || {}) };
-      sourceOverrides = Object.fromEntries(Object.entries(draft.source_overrides || {}).filter(([, enabled]) => typeof enabled === "boolean"));
-      selectedLocations = normalizeLocations(draft.locations || []);
-      notifyBands = normalizeBands(draft.notify_bands || defaultNotifyBands());
+      alertRules = {};
+      disabledAlertRules = {};
+      const draftTargets = Array.isArray(draft.targets) ? draft.targets : [];
+      selectedLocations = normalizeLocations(draftTargets
+        .filter((target) => target && typeof target === "object")
+        .map((target) => ({
+        name: target.label,
+        latitude: target.point?.latitude,
+        longitude: target.point?.longitude,
+        province: target.region?.province,
+        city: target.region?.city,
+        district: target.region?.district,
+      })));
+      notifyBands = defaultNotifyBands();
       const current = draft.current || selectedLocations[0];
       if (current) {
         nameInput.value = current.name || "";
@@ -1445,9 +1493,13 @@
       if (!bulkAction) return;
       const sourceSection = bulkAction.closest("[data-source-group]");
       const enabled = bulkAction.dataset.sourceAction === "enable";
-      sourceSection?.querySelectorAll(".source-toggle").forEach((input) => {
-        sourceOverrides[input.dataset.source] = enabled;
-      });
+      const category = sourceSection?.closest("[data-category-card]")?.dataset.categoryCard;
+      if (!category || !alertRules[category]) return;
+      const groupIds = new Set([...sourceSection.querySelectorAll("[data-source]")].map((input) => input.dataset.source));
+      const selected = sourceIds(category).filter((id) => sourceEnabled(category, id));
+      setSelectedSources(category, enabled
+        ? [...new Set([...selected, ...groupIds])]
+        : selected.filter((id) => !groupIds.has(id)));
       renderDisasterGroups();
       persistDraft();
     });
@@ -1456,14 +1508,29 @@
       const source = event.target.dataset.source;
       const rule = event.target.dataset.rule;
       if (category) {
-        disasterRules[category] = event.target.checked;
+        if (event.target.checked) {
+          const option = optionCategories.find((item) => item.id === category);
+          const restored = disabledAlertRules[category] || option?.default_alert;
+          if (restored) alertRules[category] = cloneJson(restored);
+          delete disabledAlertRules[category];
+        } else {
+          disabledAlertRules[category] = cloneJson(alertRules[category]);
+          delete alertRules[category];
+        }
         renderDisasterGroups();
       }
       if (source) {
-        sourceOverrides[source] = event.target.checked;
+        const categoryId = event.target.closest("[data-category-card]")?.dataset.categoryCard;
+        const alert = alertRules[categoryId];
+        if (!alert) return;
+        const ids = sourceIds(categoryId).filter((id) => id === source ? event.target.checked : sourceEnabled(categoryId, id));
+        setSelectedSources(categoryId, ids);
         renderDisasterGroups();
       }
-      if (rule) disasterRules[rule] = Number(event.target.value);
+      if (rule) {
+        const categoryId = event.target.closest("[data-category-card]")?.dataset.categoryCard;
+        if (alertRules[categoryId]) alertRules[categoryId][rule] = Number(event.target.value);
+      }
       persistDraft();
     });
 
@@ -1472,13 +1539,15 @@
       const used = new Set(notifyBands.map((band) => band.level));
       const level = notifyLevelOrder.find((item) => !used.has(item));
       if (!level) return setNotifyWarning("通知级别规则最多 3 条");
-      notifyBands.push({ min: level === "passive" ? 0 : level === "active" ? 2 : 3, max: level === "critical" ? 99 : level === "active" ? 2 : 1, level, label: levelLabel(level) });
+      notifyBands.push({ min: level === "passive" ? 0 : level === "active" ? 2 : 3, max: level === "critical" ? 7 : level === "active" ? 2 : 1, level, label: levelLabel(level) });
+      syncNotifyBands();
       renderNotifyBands();
       persistDraft();
     });
 
     document.querySelector("#reset-rules").addEventListener("click", () => {
       notifyBands = defaultNotifyBands();
+      syncNotifyBands();
       setNotifyWarning("");
       renderNotifyBands();
       persistDraft();
@@ -1494,6 +1563,7 @@
       notifyBands = collectBands().filter((band) => Number.isInteger(band.min) && Number.isInteger(band.max));
       notifyBands.splice(Number(remove.closest(".rule-row").dataset.index), 1);
       if (!notifyBands.length) notifyBands = defaultNotifyBands();
+      syncNotifyBands();
       renderNotifyBands();
       persistDraft();
     });
@@ -1501,11 +1571,9 @@
     form.addEventListener("submit", async (event) => {
       event.preventDefault();
       if (!configurationReady) return show("订阅配置尚未加载完成", "error");
-      if (disasterRules.earthquake_warning && !commitBands()) return show("请修正通知级别规则", "error");
-      const disasterRuleError = validateDisasterRules(disasterRules);
-      if (disasterRuleError) return show(disasterRuleError, "error");
-      const sourceSelectionError = validateSourceSelection();
-      if (sourceSelectionError) return show(sourceSelectionError, "error");
+      if (alertRules.earthquake_warning && !commitBands()) return show("请修正通知级别规则", "error");
+      const alertRuleError = validateAlertRules();
+      if (alertRuleError) return show(alertRuleError, "error");
       let locations = normalizeLocations(selectedLocations);
       if (!locations.length) {
         const lat = Number(latInput.value);
@@ -1523,12 +1591,13 @@
       const barkUrl = barkUrlInput.value;
       if (!barkUrls.includes(barkUrl)) return show("请选择有效的 Bark URL", "error");
       const payload = {
-        bark_id: barkID,
-        bark_url: barkUrl,
-        locations,
-        notify_bands: disasterRules.earthquake_warning ? notifyBands : [],
-        disaster_rules: disasterRules,
-        source_overrides: sourceOverrides,
+        destination: { type: "bark", base_url: barkUrl, device_key: barkID },
+        targets: locations.map((location) => ({
+          label: location.name,
+          point: { latitude: location.latitude, longitude: location.longitude },
+          region: { province: location.province, city: location.city, district: location.district },
+        })),
+        alerts: Object.values(alertRules),
       };
       setSubscriptionRequestInFlight(true);
       show("正在覆盖保存订阅...", "info");
@@ -1563,7 +1632,9 @@
         const res = await fetch(api + "/api/unsubscribe", {
           method: "DELETE",
           headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ bark_id: barkID }),
+          body: JSON.stringify({
+            destination: { type: "bark", base_url: barkUrlInput.value, device_key: barkID },
+          }),
         });
         const json = await parseApiResponse(res);
         if (!res.ok || !json.success) throw new Error(json.message || "取消失败");
@@ -1571,8 +1642,8 @@
         selectedLocations = [];
         cancelLocationEdit();
         notifyBands = defaultNotifyBands();
-        disasterRules = defaultDisasterRules();
-        sourceOverrides = {};
+        alertRules = Object.fromEntries(optionCategories.map((category) => [category.id, cloneJson(category.default_alert)]));
+        disabledAlertRules = {};
         renderLocations();
         renderNotifyBands();
         renderDisasterGroups();

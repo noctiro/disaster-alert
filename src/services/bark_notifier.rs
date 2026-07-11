@@ -1,5 +1,5 @@
 use crate::db::{SubscriptionSnapshot, SubscriptionStore};
-use crate::models::{DisasterEvent, Subscription, mask_bark_id};
+use crate::models::{DestinationId, DisasterEvent, Subscription, mask_device_key};
 use anyhow::{Context, Result};
 use serde::Deserialize;
 use std::collections::HashSet;
@@ -33,14 +33,13 @@ pub struct AlertTiming {
 
 #[derive(Debug, Clone)]
 pub struct AlertRecipient {
-    pub bark_id: String,
-    pub bark_url: String,
+    pub destination: DestinationId,
     pub location_name: String,
 }
 
 struct BarkMessage<'a> {
     bark_url: &'a str,
-    bark_id: &'a str,
+    device_key: &'a str,
     level: &'a str,
     title: &'a str,
     subtitle: &'a str,
@@ -169,8 +168,8 @@ impl BarkNotifier {
         let subtitle = truncate_chars(&subtitle, MAX_SUBTITLE_CHARS);
         let body = truncate_chars(&lines.join("\n"), MAX_BODY_CHARS);
         self.send_notification(BarkMessage {
-            bark_url: &recipient.bark_url,
-            bark_id: &recipient.bark_id,
+            bark_url: &recipient.destination.base_url,
+            device_key: &recipient.destination.device_key,
             level,
             title: &display_title,
             subtitle: &subtitle,
@@ -181,13 +180,13 @@ impl BarkNotifier {
 
     pub async fn send_subscription_confirm(&self, subscription: &Subscription) -> Result<()> {
         let title = "灾害预警订阅成功";
-        let subtitle = if subscription.locations.len() > 1 {
-            format!("已保存 {} 个监测地点", subscription.locations.len())
+        let subtitle = if subscription.targets.len() > 1 {
+            format!("已保存 {} 个监测地点", subscription.targets.len())
         } else {
             subscription
-                .locations
+                .targets
                 .first()
-                .map(|location| location.name.trim())
+                .map(|target| target.label.trim())
                 .filter(|name| !name.is_empty())
                 .map_or_else(
                     || "已保存监测地点".to_string(),
@@ -195,22 +194,22 @@ impl BarkNotifier {
                 )
         };
         let mut lines = vec!["你将按当前类别和通知级别规则接收灾害信息".to_string()];
-        for location in subscription.normalized_locations() {
-            let name = if location.name.trim().is_empty() {
+        for target in &subscription.targets {
+            let name = if target.label.trim().is_empty() {
                 "未命名地点"
             } else {
-                location.name.trim()
+                target.label.trim()
             };
             lines.push(format!(
                 "{}: {:.4}, {:.4}",
-                name, location.latitude, location.longitude
+                name, target.point.latitude, target.point.longitude
             ));
         }
         let body = lines.join("\n");
 
         self.send_notification(BarkMessage {
-            bark_url: &subscription.bark_url,
-            bark_id: &subscription.bark_id,
+            bark_url: subscription.bark_base_url(),
+            device_key: subscription.device_key(),
             level: "active",
             title,
             subtitle: &subtitle,
@@ -222,7 +221,7 @@ impl BarkNotifier {
     async fn send_notification(&self, message: BarkMessage<'_>) -> Result<()> {
         let BarkMessage {
             bark_url,
-            bark_id,
+            device_key,
             level,
             title,
             subtitle,
@@ -240,7 +239,7 @@ impl BarkNotifier {
         );
         let url = format!("{bark_url}/push");
         let mut payload = serde_json::json!({
-            "device_key": bark_id,
+            "device_key": device_key,
             "title": title,
             "subtitle": subtitle,
             "body": body,
@@ -277,7 +276,7 @@ impl BarkNotifier {
                         if bark_response_succeeded(&body_text) {
                             tracing::debug!(
                                 event = "bark.push_succeeded",
-                                bark_id = %mask_bark_id(bark_id),
+                                device_key = %mask_device_key(device_key),
                                 status = status_code,
                                 "bark.push_succeeded"
                             );
@@ -287,7 +286,7 @@ impl BarkNotifier {
 
                         tracing::warn!(
                             event = "bark.push_rejected",
-                            bark_id = %mask_bark_id(bark_id),
+                            device_key = %mask_device_key(device_key),
                             status = status_code,
                             cleanup = false,
                             "bark.push_rejected"
@@ -300,7 +299,7 @@ impl BarkNotifier {
                         if status.is_client_error() {
                             tracing::warn!(
                                 event = "bark.push_rejected",
-                                bark_id = %mask_bark_id(bark_id),
+                                device_key = %mask_device_key(device_key),
                                 status = status_code,
                                 cleanup = false,
                                 "bark.push_rejected"
@@ -317,7 +316,7 @@ impl BarkNotifier {
                             retries += 1;
                             tracing::warn!(
                                 event = "bark.push_retrying",
-                                bark_id = %mask_bark_id(bark_id),
+                                device_key = %mask_device_key(device_key),
                                 retry = retries,
                                 max_retries,
                                 status = status.as_u16(),
@@ -329,7 +328,7 @@ impl BarkNotifier {
 
                         tracing::error!(
                             event = "bark.push_failed",
-                            bark_id = %mask_bark_id(bark_id),
+                            device_key = %mask_device_key(device_key),
                             status = status.as_u16(),
                             "bark.push_failed"
                         );
@@ -343,7 +342,7 @@ impl BarkNotifier {
                         retries += 1;
                         tracing::warn!(
                             event = "bark.request_retrying",
-                            bark_id = %mask_bark_id(bark_id),
+                            device_key = %mask_device_key(device_key),
                             retry = retries,
                             max_retries,
                             error = ?e,
@@ -355,7 +354,7 @@ impl BarkNotifier {
 
                     tracing::error!(
                         event = "bark.request_failed",
-                        bark_id = %mask_bark_id(bark_id),
+                        device_key = %mask_device_key(device_key),
                         error = ?e,
                         "bark.request_failed"
                     );

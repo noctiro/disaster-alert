@@ -1,6 +1,8 @@
 use crate::config::Config;
 use crate::db::{Database, SubscriptionCandidateQuery, SubscriptionSnapshot};
-use crate::models::{DisasterCategory, DisasterEvent, ProviderChannel, SubscriptionLocation};
+use crate::models::{
+    AlertRule, DestinationId, DisasterCategory, DisasterEvent, MonitoringTarget, ProviderChannel,
+};
 use crate::services::event_aggregator::{DeliveryAttempt, parse_event_epoch};
 use crate::services::{AlertRecipient, AlertTiming, BarkNotifier, EventAggregator, RuntimeStatus};
 use crate::utils::{distance, intensity, region};
@@ -204,19 +206,26 @@ impl DispatcherInner {
         let prior_recipients = if event.cancel {
             Arc::new(
                 self.aggregator
-                    .delivered_bark_ids(queued.incident_id, event.category)
+                    .delivered_destinations(queued.incident_id, event.category)
                     .await,
             )
         } else {
-            Arc::new(HashSet::new())
+            Arc::new(HashMap::new())
         };
         let (sender, receiver) = mpsc::channel(self.max_concurrent.saturating_mul(2).max(1));
         let store = self.db.subscriptions();
         let event_for_lookup = Arc::clone(&event);
         let recipients_for_lookup = Arc::clone(&prior_recipients);
+        let destinations_for_lookup = Arc::new(
+            prior_recipients
+                .keys()
+                .cloned()
+                .collect::<HashSet<DestinationId>>(),
+        );
+        let destinations_for_lookup = Arc::clone(&destinations_for_lookup);
         let policy = self.policy;
         let lookup = tokio::task::spawn_blocking(move || {
-            let query = candidate_query(&event_for_lookup, &recipients_for_lookup);
+            let query = candidate_query(&event_for_lookup, &destinations_for_lookup);
             store.for_each_candidate(query, |subscription| {
                 if let Some(target) = match_subscription(
                     subscription,
@@ -250,7 +259,8 @@ impl DispatcherInner {
                     .aggregator
                     .begin_delivery(
                         queued.incident_id,
-                        &target.recipient.bark_id,
+                        target.recipient.destination.clone(),
+                        target.recipient.location_name.clone(),
                         &event,
                         self.policy.push_updates,
                         self.policy.update_min_report_gap,
@@ -545,10 +555,10 @@ fn event_supersedes_or_matches(current: &DisasterEvent, candidate: &DisasterEven
 
 fn candidate_query<'a>(
     event: &'a DisasterEvent,
-    prior_recipients: &'a HashSet<String>,
+    prior_recipients: &'a HashSet<DestinationId>,
 ) -> SubscriptionCandidateQuery<'a> {
     if event.cancel {
-        return SubscriptionCandidateQuery::BarkIds(prior_recipients);
+        return SubscriptionCandidateQuery::Destinations(prior_recipients);
     }
     match event.category {
         DisasterCategory::WeatherWarning => match event.latitude.zip(event.longitude) {
@@ -585,19 +595,21 @@ fn candidate_query<'a>(
 fn match_subscription(
     subscription: SubscriptionSnapshot,
     event: &DisasterEvent,
-    prior_recipients: &HashSet<String>,
+    prior_recipients: &HashMap<DestinationId, String>,
     policy: DispatchPolicy,
 ) -> Option<DispatchTarget> {
     let stored = &subscription.subscription;
-    if event.cancel && !prior_recipients.contains(&stored.bark_id) {
+    let destination_id = stored.destination_id();
+    if event.cancel && !prior_recipients.contains_key(&destination_id) {
         return None;
     }
     if event.cancel {
-        let location = stored.locations.first()?;
         let recipient = AlertRecipient {
-            bark_id: stored.bark_id.clone(),
-            bark_url: stored.bark_url.clone(),
-            location_name: location.name.clone(),
+            destination: destination_id,
+            location_name: prior_recipients
+                .get(&stored.destination_id())
+                .cloned()
+                .unwrap_or_default(),
         };
         return Some(DispatchTarget {
             subscription,
@@ -606,26 +618,13 @@ fn match_subscription(
             timing: None,
         });
     }
-    if !category_enabled(stored, event.category)
-        || stored.source_overrides.get(&event.source) == Some(&false)
-    {
+    if !stored.source_enabled(event.category, &event.source) {
         return None;
     }
-    if event.category == DisasterCategory::EarthquakeReport
-        && event.magnitude.unwrap_or_default() < stored.disaster_rules.min_earthquake_magnitude
-    {
-        return None;
-    }
-    if (event.category == DisasterCategory::WeatherWarning
-        && event.level < stored.disaster_rules.min_weather_level)
-        || (event.category == DisasterCategory::Tsunami
-            && event.level < stored.disaster_rules.min_tsunami_level)
-    {
-        return None;
-    }
+    let alert = stored.alert(event.category)?;
 
     let administrative = stored
-        .locations
+        .targets
         .iter()
         .find(|location| location_matches_regions(location, &event.affected_regions));
     let nearest = nearest_location(stored, event);
@@ -639,27 +638,49 @@ fn match_subscription(
         .or(nearest)?;
 
     let timing = earthquake_timing(event, distance_km, policy);
-    let level = match event.category {
-        DisasterCategory::EarthquakeWarning => stored
-            .level_for_intensity(timing.as_ref()?.estimated_intensity)?
+    let level = match alert {
+        AlertRule::EarthquakeWarning { .. } => stored
+            .interruption_level_for_intensity(timing.as_ref()?.estimated_intensity)?
+            .as_str()
             .to_string(),
-        DisasterCategory::WeatherWarning
-            if administrative.is_none()
-                && distance_km > stored.disaster_rules.weather_radius_km =>
-        {
-            return None;
+        AlertRule::EarthquakeReport { min_magnitude, .. } => {
+            if event.magnitude.unwrap_or_default() < *min_magnitude {
+                return None;
+            }
+            bark_level(event.level).to_string()
         }
-        DisasterCategory::Typhoon if distance_km > stored.disaster_rules.typhoon_radius_km => {
-            return None;
+        AlertRule::WeatherWarning {
+            min_severity,
+            fallback_radius_km,
+            ..
+        } => {
+            if event.level < *min_severity
+                || (administrative.is_none() && distance_km > *fallback_radius_km)
+            {
+                return None;
+            }
+            bark_level(event.level).to_string()
         }
-        DisasterCategory::Tsunami if administrative.is_none() && !event.cancel => return None,
-        _ => bark_level(event.level).to_string(),
+        AlertRule::Tsunami { min_severity, .. } => {
+            if event.level < *min_severity || administrative.is_none() {
+                return None;
+            }
+            bark_level(event.level).to_string()
+        }
+        AlertRule::Typhoon {
+            max_center_distance_km,
+            ..
+        } => {
+            if distance_km > *max_center_distance_km {
+                return None;
+            }
+            bark_level(event.level).to_string()
+        }
     };
 
     let recipient = AlertRecipient {
-        bark_id: stored.bark_id.clone(),
-        bark_url: stored.bark_url.clone(),
-        location_name: location.name.clone(),
+        destination: destination_id,
+        location_name: location.label.clone(),
     };
     Some(DispatchTarget {
         subscription,
@@ -669,30 +690,22 @@ fn match_subscription(
     })
 }
 
-fn category_enabled(
-    subscription: &crate::models::Subscription,
-    category: DisasterCategory,
-) -> bool {
-    match category {
-        DisasterCategory::EarthquakeWarning => subscription.disaster_rules.earthquake_warning,
-        DisasterCategory::EarthquakeReport => subscription.disaster_rules.earthquake_report,
-        DisasterCategory::WeatherWarning => subscription.disaster_rules.weather_warning,
-        DisasterCategory::Tsunami => subscription.disaster_rules.tsunami,
-        DisasterCategory::Typhoon => subscription.disaster_rules.typhoon,
-    }
-}
-
 fn nearest_location<'a>(
     subscription: &'a crate::models::Subscription,
     event: &DisasterEvent,
-) -> Option<(&'a SubscriptionLocation, f64)> {
+) -> Option<(&'a MonitoringTarget, f64)> {
     let (latitude, longitude) = event.latitude.zip(event.longitude)?;
     subscription
-        .locations
+        .targets
         .iter()
-        .filter_map(|location| {
-            distance::vincenty_distance(latitude, longitude, location.latitude, location.longitude)
-                .map(|distance| (location, distance))
+        .filter_map(|target| {
+            distance::vincenty_distance(
+                latitude,
+                longitude,
+                target.point.latitude,
+                target.point.longitude,
+            )
+            .map(|distance| (target, distance))
         })
         .min_by(|left, right| left.1.total_cmp(&right.1))
 }
@@ -748,11 +761,11 @@ fn snapshot_is_stale(event: &DisasterEvent, stale_origin_seconds: i64) -> bool {
         }
 }
 
-fn location_matches_regions(location: &SubscriptionLocation, regions: &[String]) -> bool {
+fn location_matches_regions(target: &MonitoringTarget, regions: &[String]) -> bool {
     let parts = [
-        location.province.as_str(),
-        location.city.as_str(),
-        location.district.as_str(),
+        target.region.province.as_str(),
+        target.region.city.as_str(),
+        target.region.district.as_str(),
     ];
     regions
         .iter()
@@ -774,7 +787,10 @@ fn event_channel(event: &DisasterEvent) -> ProviderChannel {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::models::{NotificationBand, Subscription};
+    use crate::models::{
+        AdministrativeRegion, AlertRule, GeoPoint, IntensityBand, InterruptionLevel,
+        MonitoringTarget, NotificationDestination, SourceSelection, Subscription,
+    };
 
     fn event(category: DisasterCategory, report_num: u32) -> DisasterEvent {
         DisasterEvent {
@@ -801,24 +817,38 @@ mod tests {
     }
 
     fn subscription() -> SubscriptionSnapshot {
-        let mut subscription = Subscription::new(
-            "device".to_string(),
-            vec![SubscriptionLocation {
-                name: "home".to_string(),
-                latitude: 35.0,
-                longitude: 106.0,
-                province: "四川省".to_string(),
-                city: "成都市".to_string(),
-                district: String::new(),
+        let subscription = Subscription::new(
+            NotificationDestination::Bark {
+                base_url: "https://api.day.app".to_string(),
+                device_key: "device".to_string(),
+            },
+            vec![MonitoringTarget {
+                label: "home".to_string(),
+                point: GeoPoint {
+                    latitude: 35.0,
+                    longitude: 106.0,
+                },
+                region: AdministrativeRegion {
+                    province: "四川省".to_string(),
+                    city: "成都市".to_string(),
+                    district: String::new(),
+                },
             }],
+            vec![
+                AlertRule::EarthquakeWarning {
+                    sources: SourceSelection::All,
+                    estimated_intensity_bands: vec![IntensityBand {
+                        min: 0,
+                        max: 7,
+                        interruption_level: InterruptionLevel::Active,
+                    }],
+                },
+                AlertRule::default_for(DisasterCategory::EarthquakeReport),
+                AlertRule::default_for(DisasterCategory::WeatherWarning),
+                AlertRule::default_for(DisasterCategory::Tsunami),
+                AlertRule::default_for(DisasterCategory::Typhoon),
+            ],
         );
-        subscription.bark_url = "https://api.day.app".to_string();
-        subscription.notify_bands = vec![NotificationBand {
-            min: 0,
-            max: 99,
-            level: "active".to_string(),
-            label: String::new(),
-        }];
         SubscriptionSnapshot::new(Arc::new(subscription))
     }
 
@@ -841,17 +871,22 @@ mod tests {
         event.latitude = None;
         event.longitude = None;
         event.affected_regions.clear();
-        let recipients = HashSet::from(["device".to_string()]);
+        let recipients = HashMap::from([(
+            subscription().subscription.destination_id(),
+            "home".to_string(),
+        )]);
         let target = match_subscription(subscription(), &event, &recipients, policy());
         assert!(target.is_some());
-        assert!(target.is_some_and(|target| target.timing.is_none()));
+        assert!(target.is_some_and(|target| {
+            target.timing.is_none() && target.recipient.location_name == "home"
+        }));
     }
 
     #[test]
     fn earthquake_region_does_not_replace_real_distance() {
         let mut event = event(DisasterCategory::EarthquakeWarning, 1);
         event.affected_regions = vec!["四川".to_string()];
-        let target = match_subscription(subscription(), &event, &HashSet::new(), policy());
+        let target = match_subscription(subscription(), &event, &HashMap::new(), policy());
         let timing = target.and_then(|target| target.timing);
         assert!(timing.is_some_and(|timing| timing.distance_km > 50.0));
     }
@@ -862,7 +897,7 @@ mod tests {
         event.latitude = None;
         event.longitude = None;
         event.affected_regions = vec!["四川省".to_string()];
-        assert!(match_subscription(subscription(), &event, &HashSet::new(), policy()).is_some());
+        assert!(match_subscription(subscription(), &event, &HashMap::new(), policy()).is_some());
     }
 
     #[tokio::test]

@@ -123,7 +123,7 @@ set -a; . ./.env; set +a
 | `POST` | `/api/subscribe` | 发送 Bark 确认提醒成功后创建或覆盖订阅 | `200` |
 | `GET` | `/api/bark-urls` | 返回网页端可选择的 Bark URL 白名单 | `200` |
 | `GET` | `/api/subscription-options` | 返回灾害类别、来源目录和默认阈值 | `200` |
-| `DELETE` | `/api/unsubscribe` | 按 Bark ID 删除订阅 | `200` |
+| `DELETE` | `/api/unsubscribe` | 按 Bark 服务与 Key 删除订阅 | `200` |
 | `GET` | `/api/stats` | 返回订阅总数 | `200` |
 | `GET` | `/api/status` | 返回两个渠道的连接、消息、解析错误、重连和队列背压指标 | `200` |
 | `GET` | `/health` | 健康检查 | `200` |
@@ -134,40 +134,50 @@ set -a; . ./.env; set +a
 
 ```json
 {
-  "bark_id": "key",
-  "bark_url": "https://api.day.app",
-  "locations": [
+  "destination": {
+    "type": "bark",
+    "base_url": "https://api.day.app",
+    "device_key": "key"
+  },
+  "targets": [
     {
-      "name": "东京",
-      "latitude": 35.6,
-      "longitude": 139.6,
-      "province": "东京都",
-      "city": "东京",
-      "district": ""
+      "label": "东京",
+      "point": { "latitude": 35.6, "longitude": 139.6 },
+      "region": { "province": "东京都", "city": "东京", "district": "" }
     }
   ],
-  "notify_bands": [
-    { "min": 1, "max": 1, "level": "passive", "label": "低烈度" },
-    { "min": 2, "max": 2, "level": "active", "label": "中等烈度" },
-    { "min": 3, "max": 99, "level": "critical", "label": "高烈度" }
-  ],
-  "disaster_rules": {
-    "earthquake_warning": true,
-    "earthquake_report": true,
-    "weather_warning": true,
-    "tsunami": true,
-    "typhoon": true,
-    "min_earthquake_magnitude": 4.5,
-    "weather_radius_km": 100,
-    "min_weather_level": 2,
-    "min_tsunami_level": 2,
-    "typhoon_radius_km": 300
-  },
-  "source_overrides": {
-    "wolfx.jma_eew": true,
-    "fanstudio.jma": true,
-    "fanstudio.weatheralarm": false
-  }
+  "alerts": [
+    {
+      "category": "earthquake_warning",
+      "sources": { "mode": "all" },
+      "estimated_intensity_bands": [
+        { "min": 1, "max": 1, "interruption_level": "passive" },
+        { "min": 2, "max": 2, "interruption_level": "active" },
+        { "min": 3, "max": 7, "interruption_level": "critical" }
+      ]
+    },
+    {
+      "category": "earthquake_report",
+      "sources": { "mode": "include", "ids": ["fanstudio.cenc", "fanstudio.usgs"] },
+      "min_magnitude": 4.5
+    },
+    {
+      "category": "weather_warning",
+      "sources": { "mode": "all" },
+      "min_severity": 2,
+      "fallback_radius_km": 100
+    },
+    {
+      "category": "tsunami",
+      "sources": { "mode": "all" },
+      "min_severity": 2
+    },
+    {
+      "category": "typhoon",
+      "sources": { "mode": "all" },
+      "max_center_distance_km": 300
+    }
+  ]
 }
 ```
 
@@ -175,24 +185,27 @@ set -a; . ./.env; set +a
 
 | 字段 | 当前请求要求 | 说明 |
 | --- | --- | --- |
-| `bark_id` | 是 | Bark Key，只允许字母和数字，最长 64 字符 |
-| `bark_url` | 是 | 必须精确匹配后端 `BARK_URL_ALLOWLIST` 中规范化后的 URL |
-| `locations` | 是 | 监测地点列表，至少 1 个、最多 3 个，有效坐标范围为纬度 `-90..90`、经度 `-180..180` |
-| `locations[].name` | 否 | 地点名称，最多 80 个字符 |
-| `locations[].province` / `city` / `district` | 否 | 行政区字段，用于天气和海啸行政区匹配 |
-| `notify_bands` | 是 | 通知规则列表，最多 3 条，烈度范围不能重叠 |
-| `notify_bands[].min` / `max` | 是 | 匹配的预估 JMA 烈度范围，取值 `0..99` |
-| `notify_bands[].level` | 是 | Bark 中断级别，只允许 `passive`、`active`、`critical` |
-| `notify_bands[].label` | 否 | 前端展示标签，最多 32 个字符 |
-| `disaster_rules` | 否 | 灾种开关和阈值；省略时使用全部灾种开启的默认配置 |
-| `source_overrides` | 否 | 按来源覆盖开关；未出现的来源默认开启，键必须来自 `/api/subscription-options` |
+| `destination` | 是 | 推送目的地。当前仅支持 `type: "bark"` |
+| `destination.base_url` | 是 | 必须精确匹配后端 `BARK_URL_ALLOWLIST` 中规范化后的 URL |
+| `destination.device_key` | 是 | Bark Key，只允许字母和数字，最长 64 字符 |
+| `targets` | 是 | 监测目标列表，至少 1 个、最多 3 个 |
+| `targets[].label` | 否 | 地点名称，最多 80 个字符 |
+| `targets[].point` | 是 | 有效坐标范围为纬度 `-90..90`、经度 `-180..180` |
+| `targets[].region` | 否 | 省、市、区字段，用于天气和海啸行政区匹配 |
+| `alerts` | 是 | 启用的灾害规则。未出现的灾种不订阅，类别不能重复 |
+| `alerts[].sources` | 是 | 来源选择。`all` 表示包括将来新增的同类来源；`include` 为固定来源白名单 |
+| `earthquake_warning.estimated_intensity_bands` | 是 | 最多 3 条、范围为 `0..7`、不能重叠。未覆盖的烈度不发送通知 |
+| `earthquake_report.min_magnitude` | 是 | 最低震级，范围 `0..10` |
+| `weather_warning.min_severity` / `tsunami.min_severity` | 是 | 最低严重度，范围 `1..4` |
+| `weather_warning.fallback_radius_km` | 是 | 未提供行政区命中时的坐标回退半径，范围 `1..2000` 公里 |
+| `typhoon.max_center_distance_km` | 是 | 台风中心最大距离，范围 `1..3000` 公里 |
 
 说明：
 
-- `locations` 是地点配置，至少包含一个有效地点
-- `critical` 规则的 `max` 小于 `7` 时，后端会扩展为 `99`
-- 新订阅默认启用 Wolfx 和 FAN Studio `/all` 中的全部受支持类别与来源
-- 同一地震在两个渠道间按时间、距离和震级关联，但来源过滤在订阅匹配阶段完成；禁用 Wolfx 不会阻止已启用的 FAN Studio 来源通知
+- 取消或解除事件只发送给此前成功收到同一事件的设备，不会重新按当前订阅规则匹配
+- 地震速报沿用全局候选订阅匹配；天气、海啸和台风的空间匹配分别由规则字段决定
+- `/api/subscription-options` 返回按灾种组织的来源目录及每种规则的完整默认值，Web 界面以此生成配置
+- 订阅身份是 `destination.base_url` 与 `destination.device_key` 的组合；同一 Key 可用于不同 Bark 服务，分别保存和删除
 
 成功响应：
 
@@ -208,10 +221,10 @@ set -a; . ./.env; set +a
 
 | 状态码 | 原因 |
 | --- | --- |
-| `400` | Bark ID 为空、过长或包含非字母数字字符 |
+| `400` | `destination.device_key` 为空、过长或包含非字母数字字符 |
 | `400` | Bark URL 无效或不在白名单中 |
 | `400` | 没有有效监测地点 |
-| `400` | 通知规则为空、超过 3 条、级别非法或烈度范围重叠 |
+| `400` | 灾害规则为空、类别重复、来源不属于对应灾种或阈值超出范围 |
 | `502` | Bark 确认提醒发送失败，订阅未保存 |
 | `500` | 数据库存储失败 |
 
@@ -220,7 +233,13 @@ set -a; . ./.env; set +a
 请求体：
 
 ```json
-{ "bark_id": "key" }
+{
+  "destination": {
+    "type": "bark",
+    "base_url": "https://api.day.app",
+    "device_key": "key"
+  }
+}
 ```
 
 成功响应：
@@ -236,12 +255,13 @@ set -a; . ./.env; set +a
 
 | 状态码 | 原因 |
 | --- | --- |
-| `400` | Bark ID 为空、过长或包含非字母数字字符 |
-| `404` | 删除失败，通常表示没有对应订阅或数据库删除失败 |
+| `400` | `destination` 无效，或其中的 Bark Key / Bark URL 无效 |
+| `404` | 当前 Bark 服务与 Key 没有对应订阅 |
+| `500` | 数据库删除失败 |
 
 ### `GET /api/stats`
 
-返回订阅总数，不返回 Bark ID、位置、通知规则或订阅时间：
+返回订阅总数，不返回 Bark Key、位置、通知规则或订阅时间：
 
 ```json
 {

@@ -1,4 +1,4 @@
-use crate::models::{DisasterCategory, ProviderChannel};
+use crate::models::{AlertRule, DisasterCategory, ProviderChannel};
 use serde::Serialize;
 
 #[derive(Debug, Clone, Copy)]
@@ -15,9 +15,16 @@ pub struct SourceDefinition {
 #[derive(Debug, Clone, Serialize)]
 pub struct SourceGroup {
     pub id: &'static str,
-    pub category: &'static str,
     pub label: &'static str,
     pub sources: Vec<SourceOption>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct CategoryOption {
+    pub id: &'static str,
+    pub label: &'static str,
+    pub source_groups: Vec<SourceGroup>,
+    pub default_alert: AlertRule,
 }
 
 #[derive(Debug, Clone, Copy, Serialize)]
@@ -326,27 +333,39 @@ pub fn find_provider(
         .find(|source| source.channel == channel && source.provider_key == provider_key)
 }
 
-pub fn groups() -> Vec<SourceGroup> {
-    let mut groups = Vec::<SourceGroup>::new();
-    for source in SOURCES {
-        if let Some(group) = groups.iter_mut().find(|group| group.id == source.group_id) {
-            group.sources.push(SourceOption {
-                id: source.id,
-                label: source.label,
-            });
-        } else {
-            groups.push(SourceGroup {
-                id: source.group_id,
-                category: source.category.as_str(),
-                label: source.group_label,
-                sources: vec![SourceOption {
-                    id: source.id,
-                    label: source.label,
-                }],
-            });
-        }
-    }
-    groups
+pub fn category_options() -> Vec<CategoryOption> {
+    DisasterCategory::ALL
+        .into_iter()
+        .map(|category| {
+            let mut source_groups = Vec::<SourceGroup>::new();
+            for source in SOURCES.iter().filter(|source| source.category == category) {
+                if let Some(group) = source_groups
+                    .iter_mut()
+                    .find(|group| group.id == source.group_id)
+                {
+                    group.sources.push(SourceOption {
+                        id: source.id,
+                        label: source.label,
+                    });
+                } else {
+                    source_groups.push(SourceGroup {
+                        id: source.group_id,
+                        label: source.group_label,
+                        sources: vec![SourceOption {
+                            id: source.id,
+                            label: source.label,
+                        }],
+                    });
+                }
+            }
+            CategoryOption {
+                id: category.as_str(),
+                label: category.label(),
+                source_groups,
+                default_alert: AlertRule::default_for(category),
+            }
+        })
+        .collect()
 }
 
 #[cfg(test)]
@@ -374,8 +393,9 @@ mod tests {
             );
         }
         assert_eq!(
-            groups()
+            category_options()
                 .iter()
+                .flat_map(|category| &category.source_groups)
                 .map(|group| group.sources.len())
                 .sum::<usize>(),
             SOURCES.len()

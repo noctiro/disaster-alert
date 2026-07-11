@@ -1,4 +1,4 @@
-use crate::models::{DisasterCategory, DisasterEvent};
+use crate::models::{DestinationId, DisasterCategory, DisasterEvent};
 use crate::utils::distance;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::{Arc, Mutex as StdMutex, MutexGuard as StdMutexGuard};
@@ -46,12 +46,13 @@ struct DeliveryState {
 struct DeliveryKey {
     incident_id: u64,
     category: DisasterCategory,
-    bark_id: String,
+    destination: DestinationId,
 }
 
 #[derive(Default)]
 struct DeliveryEntry {
     committed: Option<DeliveryVersion>,
+    location_name: Option<String>,
     pending: Option<PendingClaim>,
     seen_revisions: HashSet<(String, String)>,
 }
@@ -92,6 +93,7 @@ pub struct DeliveryPermit {
     aggregator: EventAggregator,
     key: DeliveryKey,
     event: DisasterEvent,
+    location_name: String,
     token: u64,
     finished: bool,
 }
@@ -171,7 +173,8 @@ impl EventAggregator {
     pub async fn begin_delivery(
         &self,
         incident_id: u64,
-        bark_id: &str,
+        destination: DestinationId,
+        location_name: String,
         event: &DisasterEvent,
         push_updates: bool,
         min_report_gap: u32,
@@ -180,7 +183,7 @@ impl EventAggregator {
         let key = DeliveryKey {
             incident_id,
             category: event.category,
-            bark_id: bark_id.to_string(),
+            destination,
         };
         let mut deliveries = self.lock_deliveries();
         cleanup_deliveries(&mut deliveries, now, self.keep);
@@ -212,16 +215,17 @@ impl EventAggregator {
             aggregator: self.clone(),
             key,
             event: event.clone(),
+            location_name,
             token,
             finished: false,
         }))
     }
 
-    pub async fn delivered_bark_ids(
+    pub async fn delivered_destinations(
         &self,
         incident_id: u64,
         category: DisasterCategory,
-    ) -> std::collections::HashSet<String> {
+    ) -> HashMap<DestinationId, String> {
         let deliveries = self.lock_deliveries();
         deliveries
             .entries
@@ -231,7 +235,12 @@ impl EventAggregator {
                     && key.category == category
                     && entry.committed.is_some()
             })
-            .map(|(key, _entry)| key.bark_id.clone())
+            .map(|(key, entry)| {
+                (
+                    key.destination.clone(),
+                    entry.location_name.clone().unwrap_or_default(),
+                )
+            })
             .collect()
     }
 
@@ -256,6 +265,7 @@ impl DeliveryPermit {
                 .is_some_and(|claim| claim.token == self.token)
         {
             entry.pending = None;
+            entry.location_name = Some(self.location_name.clone());
             if !self.event.revision.is_empty() {
                 entry
                     .seen_revisions
@@ -536,6 +546,13 @@ mod tests {
     use super::*;
     use crate::models::ProviderChannel;
 
+    fn destination(device_key: &str) -> DestinationId {
+        DestinationId {
+            base_url: "https://api.day.app".to_string(),
+            device_key: device_key.to_string(),
+        }
+    }
+
     fn earthquake(source: &str, event_id: &str, report_num: u32, lat: f64) -> DisasterEvent {
         DisasterEvent {
             category: DisasterCategory::EarthquakeWarning,
@@ -574,7 +591,14 @@ mod tests {
         assert_eq!(first, second);
 
         let wolfx_permit = aggregator
-            .begin_delivery(first, "wolfx-only", &wolfx, true, 1)
+            .begin_delivery(
+                first,
+                destination("wolfx-only"),
+                String::new(),
+                &wolfx,
+                true,
+                1,
+            )
             .await;
         assert!(matches!(wolfx_permit, DeliveryAttempt::Acquired(_)));
         if let DeliveryAttempt::Acquired(permit) = wolfx_permit {
@@ -582,13 +606,27 @@ mod tests {
         }
         assert!(
             aggregator
-                .begin_delivery(second, "fan-only", &fanstudio, true, 1)
+                .begin_delivery(
+                    second,
+                    destination("fan-only"),
+                    String::new(),
+                    &fanstudio,
+                    true,
+                    1
+                )
                 .await
                 .is_acquired()
         );
         assert!(
             aggregator
-                .begin_delivery(second, "wolfx-only", &fanstudio, true, 1)
+                .begin_delivery(
+                    second,
+                    destination("wolfx-only"),
+                    String::new(),
+                    &fanstudio,
+                    true,
+                    1
+                )
                 .await
                 .is_duplicate()
         );
@@ -650,7 +688,14 @@ mod tests {
         let incident = aggregator.correlate(&first).await;
         assert_eq!(incident, aggregator.correlate(&cross_source).await);
         let permit = match aggregator
-            .begin_delivery(incident, "device", &first, true, 1)
+            .begin_delivery(
+                incident,
+                destination("device"),
+                String::new(),
+                &first,
+                true,
+                1,
+            )
             .await
         {
             DeliveryAttempt::Acquired(permit) => permit,
@@ -662,7 +707,14 @@ mod tests {
         permit.commit().await;
         assert!(
             aggregator
-                .begin_delivery(incident, "device", &cross_source, true, 1)
+                .begin_delivery(
+                    incident,
+                    destination("device"),
+                    String::new(),
+                    &cross_source,
+                    true,
+                    1
+                )
                 .await
                 .is_acquired()
         );
@@ -674,14 +726,28 @@ mod tests {
         let event = earthquake("fanstudio.jma", "a", 1, 35.0);
         let incident = aggregator.correlate(&event).await;
         let permit = aggregator
-            .begin_delivery(incident, "device", &event, true, 1)
+            .begin_delivery(
+                incident,
+                destination("device"),
+                String::new(),
+                &event,
+                true,
+                1,
+            )
             .await;
         assert!(permit.is_acquired());
         drop(permit);
         tokio::task::yield_now().await;
         assert!(
             aggregator
-                .begin_delivery(incident, "device", &event, true, 1)
+                .begin_delivery(
+                    incident,
+                    destination("device"),
+                    String::new(),
+                    &event,
+                    true,
+                    1
+                )
                 .await
                 .is_acquired()
         );
@@ -696,12 +762,26 @@ mod tests {
         final_report.final_report = true;
         let incident = aggregator.correlate(&first).await;
         let claim = aggregator
-            .begin_delivery(incident, "device", &first, true, 1)
+            .begin_delivery(
+                incident,
+                destination("device"),
+                String::new(),
+                &first,
+                true,
+                1,
+            )
             .await;
         assert!(claim.is_acquired());
         assert!(matches!(
             aggregator
-                .begin_delivery(incident, "device", &final_report, true, 1)
+                .begin_delivery(
+                    incident,
+                    destination("device"),
+                    String::new(),
+                    &final_report,
+                    true,
+                    1
+                )
                 .await,
             DeliveryAttempt::Busy
         ));
@@ -716,7 +796,14 @@ mod tests {
         update.revision = "2".to_string();
         let incident = aggregator.correlate(&first).await;
         let permit = match aggregator
-            .begin_delivery(incident, "device", &first, true, 1)
+            .begin_delivery(
+                incident,
+                destination("device"),
+                String::new(),
+                &first,
+                true,
+                1,
+            )
             .await
         {
             DeliveryAttempt::Acquired(permit) => permit,
@@ -727,7 +814,14 @@ mod tests {
         };
         permit.commit().await;
         let permit = match aggregator
-            .begin_delivery(incident, "device", &update, true, 1)
+            .begin_delivery(
+                incident,
+                destination("device"),
+                String::new(),
+                &update,
+                true,
+                1,
+            )
             .await
         {
             DeliveryAttempt::Acquired(permit) => permit,
@@ -739,13 +833,27 @@ mod tests {
         permit.abort().await;
         assert!(matches!(
             aggregator
-                .begin_delivery(incident, "device", &first, true, 1)
+                .begin_delivery(
+                    incident,
+                    destination("device"),
+                    String::new(),
+                    &first,
+                    true,
+                    1
+                )
                 .await,
             DeliveryAttempt::Duplicate
         ));
         assert!(matches!(
             aggregator
-                .begin_delivery(incident, "device", &update, true, 1)
+                .begin_delivery(
+                    incident,
+                    destination("device"),
+                    String::new(),
+                    &update,
+                    true,
+                    1
+                )
                 .await,
             DeliveryAttempt::Acquired(_)
         ));
@@ -759,7 +867,14 @@ mod tests {
         cancelled.cancel = true;
         let incident = aggregator.correlate(&first).await;
         let permit = match aggregator
-            .begin_delivery(incident, "device", &first, true, 1)
+            .begin_delivery(
+                incident,
+                destination("device"),
+                String::new(),
+                &first,
+                true,
+                1,
+            )
             .await
         {
             DeliveryAttempt::Acquired(permit) => permit,
@@ -771,7 +886,14 @@ mod tests {
         permit.commit().await;
         assert!(
             aggregator
-                .begin_delivery(incident, "device", &cancelled, true, 1)
+                .begin_delivery(
+                    incident,
+                    destination("device"),
+                    String::new(),
+                    &cancelled,
+                    true,
+                    1
+                )
                 .await
                 .is_acquired()
         );

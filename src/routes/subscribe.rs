@@ -1,15 +1,15 @@
 use crate::config::normalize_bark_url;
 use crate::db::{Database, StoreErrorKind, SubscriptionStore};
 use crate::models::{
-    ApiResponse, NotificationBand, SubscribeRequest, Subscription, SubscriptionLocation,
-    UnsubscribeRequest, mask_bark_id, validate_bark_level,
+    ApiResponse, MonitoringTarget, NotificationDestination, SubscribeRequest, Subscription,
+    UnsubscribeRequest, mask_device_key,
 };
 use crate::services::{BarkNotifier, ReverseGeocodeResult, ReverseGeocoder, RuntimeStatus};
-use crate::source_registry::{SourceGroup, groups};
+use crate::source_registry::{CategoryOption, category_options};
 use crate::utils::distance;
 use axum::{
     Json,
-    extract::{Query, State},
+    extract::{Query, State, rejection::JsonRejection},
     http::StatusCode,
     response::IntoResponse,
 };
@@ -17,8 +17,6 @@ use serde::{Deserialize, Serialize};
 
 const MAX_LOCATIONS: usize = 3;
 const MAX_LOCATION_NAME_CHARS: usize = 80;
-const MAX_NOTIFY_BANDS: usize = 3;
-const MAX_BAND_LABEL_CHARS: usize = 32;
 
 #[derive(Clone)]
 pub struct AppState {
@@ -74,9 +72,18 @@ pub async fn reverse_geocode_handler(
 
 pub async fn subscribe_handler(
     State(state): State<AppState>,
-    Json(payload): Json<SubscribeRequest>,
+    payload: Result<Json<SubscribeRequest>, JsonRejection>,
 ) -> impl IntoResponse {
-    let bark_id = match validate_bark_id(&payload.bark_id) {
+    let Json(payload) = match payload {
+        Ok(payload) => payload,
+        Err(_) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(ApiResponse::<SubscribeResponse>::error("订阅请求体无效")),
+            );
+        }
+    };
+    let device_key = match validate_device_key(payload.destination.bark_device_key()) {
         Ok(value) => value,
         Err((status, message)) => {
             return (
@@ -86,7 +93,7 @@ pub async fn subscribe_handler(
         }
     };
 
-    let bark_url = match normalize_bark_url(&payload.bark_url) {
+    let bark_url = match normalize_bark_url(payload.destination.bark_base_url()) {
         Ok(value) => value,
         Err(_error) => {
             return (
@@ -104,8 +111,8 @@ pub async fn subscribe_handler(
         );
     }
 
-    let locations = match normalize_locations(&payload) {
-        Ok(locations) => locations,
+    let targets = match normalize_targets(payload.targets) {
+        Ok(targets) => targets,
         Err(message) => {
             return (
                 StatusCode::BAD_REQUEST,
@@ -113,51 +120,26 @@ pub async fn subscribe_handler(
             );
         }
     };
-    if locations.is_empty() {
-        return (
-            StatusCode::BAD_REQUEST,
-            Json(ApiResponse::<SubscribeResponse>::error(
-                "请至少添加一个有效监测地点",
-            )),
-        );
-    }
-    let notify_bands = match resolve_notify_bands(&payload) {
-        Ok(bands) => bands,
-        Err(message) => {
-            return (
-                StatusCode::BAD_REQUEST,
-                Json(ApiResponse::<SubscribeResponse>::error(message)),
-            );
-        }
-    };
-    if let Err(message) = payload.disaster_rules.validate() {
+    let subscription = Subscription::new(
+        NotificationDestination::Bark {
+            base_url: bark_url,
+            device_key,
+        },
+        targets,
+        payload.alerts,
+    );
+    if let Err(message) = subscription.validate() {
         return (
             StatusCode::BAD_REQUEST,
             Json(ApiResponse::<SubscribeResponse>::error(message)),
         );
     }
-    if payload.source_overrides.len() > 64
-        || payload
-            .source_overrides
-            .keys()
-            .any(|source| !known_source(source))
-    {
-        return (
-            StatusCode::BAD_REQUEST,
-            Json(ApiResponse::<SubscribeResponse>::error("灾害来源配置无效")),
-        );
-    }
-    let mut subscription = Subscription::new(bark_id, locations);
-    subscription.bark_url = bark_url;
-    subscription.notify_bands = notify_bands;
-    subscription.disaster_rules = payload.disaster_rules;
-    subscription.source_overrides = payload.source_overrides;
 
     tracing::info!(
         event = "subscription.requested",
-        bark_id = %mask_bark_id(&subscription.bark_id),
-        location_count = subscription.locations.len(),
-        band_count = subscription.notify_bands.len(),
+        device_key = %mask_device_key(subscription.device_key()),
+        target_count = subscription.targets.len(),
+        alert_count = subscription.alerts.len(),
         "subscription.requested"
     );
 
@@ -168,7 +150,7 @@ pub async fn subscribe_handler(
     {
         tracing::error!(
             event = "subscription.confirm_failed",
-            bark_id = %mask_bark_id(&subscription.bark_id),
+            device_key = %mask_device_key(subscription.device_key()),
             error = ?error,
             "subscription.confirm_failed"
         );
@@ -187,7 +169,7 @@ pub async fn subscribe_handler(
         Ok(_) => {
             tracing::info!(
                 event = "subscription.request_completed",
-                bark_id = %mask_bark_id(&subscription.bark_id),
+                device_key = %mask_device_key(subscription.device_key()),
                 "subscription.request_completed"
             );
             (
@@ -201,7 +183,7 @@ pub async fn subscribe_handler(
         Err(e) => {
             tracing::error!(
                 event = "subscription.request_failed",
-                bark_id = %mask_bark_id(&subscription.bark_id),
+                device_key = %mask_device_key(subscription.device_key()),
                 error = ?e,
                 "subscription.request_failed"
             );
@@ -216,50 +198,72 @@ pub async fn subscribe_handler(
     }
 }
 
-fn known_source(source: &str) -> bool {
-    crate::source_registry::find(source).is_some()
-}
-
 #[derive(Serialize)]
 pub struct SubscriptionOptionsResponse {
-    pub groups: Vec<SourceGroup>,
-    pub defaults: crate::models::DisasterRules,
+    pub categories: Vec<CategoryOption>,
 }
 
 pub async fn subscription_options_handler() -> impl IntoResponse {
     Json(ApiResponse::success(
         "订阅选项获取成功",
         Some(SubscriptionOptionsResponse {
-            groups: groups(),
-            defaults: crate::models::DisasterRules::default(),
+            categories: category_options(),
         }),
     ))
 }
 
 pub async fn unsubscribe_handler(
     State(state): State<AppState>,
-    Json(payload): Json<UnsubscribeRequest>,
+    payload: Result<Json<UnsubscribeRequest>, JsonRejection>,
 ) -> impl IntoResponse {
-    let bark_id = match validate_bark_id(&payload.bark_id) {
+    let Json(payload) = match payload {
+        Ok(payload) => payload,
+        Err(_) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(ApiResponse::<()>::error("取消订阅请求体无效")),
+            );
+        }
+    };
+    let device_key = match validate_device_key(payload.destination.bark_device_key()) {
         Ok(value) => value,
         Err((status, message)) => {
             return (status, Json(ApiResponse::<()>::error(message)));
         }
     };
+    let base_url = match normalize_bark_url(payload.destination.bark_base_url()) {
+        Ok(value) if state.bark_notifier.allows_bark_url(&value) => value,
+        Ok(_) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(ApiResponse::<()>::error("Bark URL 不在允许列表中")),
+            );
+        }
+        Err(_) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(ApiResponse::<()>::error("Bark URL 无效")),
+            );
+        }
+    };
+    let destination_id = crate::models::DestinationId {
+        base_url,
+        device_key,
+    };
 
     tracing::info!(
         event = "subscription.delete_requested",
-        bark_id = %mask_bark_id(&bark_id),
+        device_key = %mask_device_key(&destination_id.device_key),
         "subscription.delete_requested"
     );
 
     let store = state.db.subscriptions();
-    let delete_bark_id = bark_id.clone();
-    match run_store(move || store.delete_subscription(&delete_bark_id)).await {
+    let destination_to_delete = destination_id.clone();
+    match run_store(move || store.delete_subscription(&destination_to_delete)).await {
         Ok(_) => {
             tracing::info!(
                 event = "subscription.delete_completed",
-                bark_id = %mask_bark_id(&bark_id),
+                device_key = %mask_device_key(&destination_id.device_key),
                 "subscription.delete_completed"
             );
             (
@@ -270,7 +274,7 @@ pub async fn unsubscribe_handler(
         Err(e) => {
             tracing::error!(
                 event = "subscription.delete_failed",
-                bark_id = %mask_bark_id(&bark_id),
+                device_key = %mask_device_key(&destination_id.device_key),
                 error = ?e,
                 "subscription.delete_failed"
             );
@@ -297,26 +301,24 @@ impl From<Subscription> for SubscribeResponse {
     }
 }
 
-fn normalize_locations(payload: &SubscribeRequest) -> Result<Vec<SubscriptionLocation>, String> {
-    let mut locations = payload.locations.clone();
-    if locations.is_empty() {
+fn normalize_targets(mut targets: Vec<MonitoringTarget>) -> Result<Vec<MonitoringTarget>, String> {
+    if targets.is_empty() {
         return Err("请至少添加一个有效监测地点".to_string());
     }
-    if locations.len() > MAX_LOCATIONS {
+    if targets.len() > MAX_LOCATIONS {
         return Err(format!("监测地点最多 {MAX_LOCATIONS} 个"));
     }
-    if locations
-        .iter()
-        .any(|item| !distance::validate_coordinates(item.latitude, item.longitude))
-    {
+    if targets.iter().any(|target| {
+        !distance::validate_coordinates(target.point.latitude, target.point.longitude)
+    }) {
         return Err("监测地点坐标无效".to_string());
     }
-    for location in &mut locations {
+    for target in &mut targets {
         for (label, value) in [
-            ("名称", &mut location.name),
-            ("省级行政区", &mut location.province),
-            ("城市", &mut location.city),
-            ("区县", &mut location.district),
+            ("名称", &mut target.label),
+            ("省级行政区", &mut target.region.province),
+            ("城市", &mut target.region.city),
+            ("区县", &mut target.region.district),
         ] {
             let trimmed = value.trim();
             if trimmed.chars().count() > MAX_LOCATION_NAME_CHARS {
@@ -327,71 +329,24 @@ fn normalize_locations(payload: &SubscribeRequest) -> Result<Vec<SubscriptionLoc
             *value = trimmed.to_string();
         }
     }
-    Ok(locations)
+    Ok(targets)
 }
 
-fn normalize_notify_bands(payload: &SubscribeRequest) -> Result<Vec<NotificationBand>, String> {
-    if payload.notify_bands.is_empty() {
-        return Err("请至少添加一条通知级别规则".to_string());
-    }
-    if payload.notify_bands.len() > MAX_NOTIFY_BANDS {
-        return Err(format!("通知级别规则最多 {MAX_NOTIFY_BANDS} 条"));
-    }
-    let mut bands = payload.notify_bands.clone();
-    bands.sort_by_key(|band| band.min);
-    let mut levels = std::collections::HashSet::new();
-    let mut used = std::collections::HashSet::new();
-    for band in &mut bands {
-        band.level = band.level.trim().to_ascii_lowercase();
-        if !validate_bark_level(&band.level) {
-            return Err("通知级别必须是 passive、active 或 critical".to_string());
-        }
-        if !levels.insert(band.level.clone()) {
-            return Err("每个通知级别只能添加一条规则".to_string());
-        }
-        if band.min > band.max || band.min > 99 || band.max > 99 {
-            return Err("通知级别烈度范围无效".to_string());
-        }
-        if band.level == "critical" && band.max < 7 {
-            band.max = 99;
-        }
-        let trimmed_label = band.label.trim();
-        if trimmed_label.chars().count() > MAX_BAND_LABEL_CHARS {
-            return Err(format!("通知级别标签最多 {MAX_BAND_LABEL_CHARS} 个字符"));
-        }
-        band.label = trimmed_label.to_string();
-        for value in band.min..=band.max {
-            if !used.insert(value) {
-                return Err("通知级别烈度范围不能重叠".to_string());
-            }
-        }
-    }
-    Ok(bands)
-}
-
-fn resolve_notify_bands(payload: &SubscribeRequest) -> Result<Vec<NotificationBand>, String> {
-    if !payload.disaster_rules.earthquake_warning && payload.notify_bands.is_empty() {
-        Ok(Vec::new())
-    } else {
-        normalize_notify_bands(payload)
-    }
-}
-
-fn validate_bark_id(raw: &str) -> std::result::Result<String, (StatusCode, String)> {
+fn validate_device_key(raw: &str) -> std::result::Result<String, (StatusCode, String)> {
     let trimmed = raw.trim();
     if trimmed.is_empty() {
-        return Err((StatusCode::BAD_REQUEST, "Bark ID 不能为空".to_string()));
+        return Err((StatusCode::BAD_REQUEST, "Bark Key 不能为空".to_string()));
     }
     if trimmed.len() > 64 {
         return Err((
             StatusCode::BAD_REQUEST,
-            "Bark ID 过长（最大64字符）".to_string(),
+            "Bark Key 过长（最大64字符）".to_string(),
         ));
     }
     if !trimmed.bytes().all(|byte| byte.is_ascii_alphanumeric()) {
         return Err((
             StatusCode::BAD_REQUEST,
-            "Bark ID 只能包含字母、数字".to_string(),
+            "Bark Key 只能包含字母、数字".to_string(),
         ));
     }
     Ok(trimmed.to_string())
@@ -474,38 +429,35 @@ mod tests {
 
     fn request() -> SubscribeRequest {
         SubscribeRequest {
-            bark_id: "abc123".to_string(),
-            bark_url: "https://api.day.app".to_string(),
-            locations: vec![SubscriptionLocation {
-                name: "home".to_string(),
-                latitude: 35.0,
-                longitude: 105.0,
-                province: String::new(),
-                city: String::new(),
-                district: String::new(),
+            destination: NotificationDestination::Bark {
+                base_url: "https://api.day.app".to_string(),
+                device_key: "abc123".to_string(),
+            },
+            targets: vec![MonitoringTarget {
+                label: "home".to_string(),
+                point: crate::models::GeoPoint {
+                    latitude: 35.0,
+                    longitude: 105.0,
+                },
+                region: crate::models::AdministrativeRegion::default(),
             }],
-            notify_bands: Vec::new(),
-            disaster_rules: crate::models::DisasterRules::default(),
-            source_overrides: std::collections::HashMap::new(),
+            alerts: vec![crate::models::AlertRule::default_for(
+                crate::models::DisasterCategory::WeatherWarning,
+            )],
         }
     }
 
     #[test]
-    fn weather_only_subscription_accepts_empty_intensity_bands() {
-        let mut payload = request();
-        payload.disaster_rules.earthquake_warning = false;
-        assert!(matches!(resolve_notify_bands(&payload), Ok(bands) if bands.is_empty()));
-    }
-
-    #[test]
-    fn earthquake_warning_subscription_requires_intensity_bands() {
-        assert!(resolve_notify_bands(&request()).is_err());
+    fn weather_only_subscription_does_not_require_intensity_bands() {
+        let payload = request();
+        let subscription = Subscription::new(payload.destination, payload.targets, payload.alerts);
+        assert!(subscription.validate().is_ok());
     }
 
     #[test]
     fn administrative_fields_obey_location_length_limit() {
         let mut payload = request();
-        payload.locations[0].province = "省".repeat(MAX_LOCATION_NAME_CHARS + 1);
-        assert!(normalize_locations(&payload).is_err());
+        payload.targets[0].region.province = "省".repeat(MAX_LOCATION_NAME_CHARS + 1);
+        assert!(normalize_targets(payload.targets).is_err());
     }
 }

@@ -1,4 +1,4 @@
-use crate::models::{Subscription, mask_bark_id};
+use crate::models::{DestinationId, Subscription, mask_device_key};
 use crate::utils::region;
 use anyhow::{Result, anyhow};
 use sled::Db;
@@ -28,7 +28,7 @@ impl SubscriptionSnapshot {
 }
 
 struct SubscriptionCache {
-    by_bark_id: HashMap<String, Arc<Subscription>>,
+    by_destination: HashMap<DestinationId, Arc<Subscription>>,
     snapshot: Arc<Vec<Arc<Subscription>>>,
     spatial: Arc<SubscriptionIndex>,
     snapshot_dirty: bool,
@@ -42,7 +42,7 @@ struct SubscriptionIndex {
 
 pub enum SubscriptionCandidateQuery<'a> {
     All,
-    BarkIds(&'a HashSet<String>),
+    Destinations(&'a HashSet<DestinationId>),
     Regions(&'a [String]),
     Radius {
         latitude: f64,
@@ -69,14 +69,16 @@ impl SubscriptionStore {
         for item in db.scan_prefix(b"sub:") {
             let (key, value) = item?;
             match serde_json::from_slice::<Subscription>(&value) {
-                Ok(mut subscription) if subscription_key_matches(&key, &subscription.bark_id) => {
-                    subscription.normalize_for_storage().map_err(|error| {
+                Ok(subscription)
+                    if subscription_key_matches(&key, &subscription.destination_id()) =>
+                {
+                    subscription.validate().map_err(|error| {
                         anyhow!(
                             "invalid subscription record {}: {error}",
                             mask_subscription_key(&key)
                         )
                     })?;
-                    subscriptions.insert(subscription.bark_id.clone(), Arc::new(subscription));
+                    subscriptions.insert(subscription.destination_id(), Arc::new(subscription));
                 }
                 Ok(_subscription) => {
                     anyhow::bail!(
@@ -102,7 +104,7 @@ impl SubscriptionStore {
         Ok(Self {
             db,
             cache: Arc::new(RwLock::new(SubscriptionCache {
-                by_bark_id: subscriptions,
+                by_destination: subscriptions,
                 snapshot,
                 spatial,
                 snapshot_dirty: false,
@@ -113,45 +115,51 @@ impl SubscriptionStore {
 
     pub fn upsert_subscription(&self, mut subscription: Subscription) -> Result<()> {
         subscription
-            .normalize_for_storage()
+            .validate()
             .map_err(|error| anyhow!("invalid subscription: {error}"))?;
-        let bark_id = subscription.bark_id.clone();
-        let primary_key = format!("sub:{}", bark_id);
-        let primary_value = serde_json::to_vec(&subscription)?;
+        let destination_id = subscription.destination_id();
+        let primary_key = subscription_key(&destination_id);
         let _write_guard = self.lock_write_gate();
+        let existing_created_at = self
+            .read_cache()
+            .by_destination
+            .get(&destination_id)
+            .map(|existing| existing.created_at);
+        subscription.prepare_for_upsert(existing_created_at);
+        let primary_value = serde_json::to_vec(&subscription)?;
         let is_new_subscription = self
             .db
             .insert(primary_key.as_bytes(), primary_value)?
             .is_none();
         let mut cache = self.write_cache();
         cache
-            .by_bark_id
-            .insert(bark_id.clone(), Arc::new(subscription));
+            .by_destination
+            .insert(destination_id.clone(), Arc::new(subscription));
         cache.snapshot_dirty = true;
 
         tracing::info!(
             event = "subscription.stored",
             action = if is_new_subscription { "insert" } else { "update" },
-            bark_id = %mask_bark_id(&bark_id),
+            device_key = %mask_device_key(&destination_id.device_key),
             "subscription.stored"
         );
 
         Ok(())
     }
 
-    pub fn delete_subscription(&self, bark_id: &str) -> Result<()> {
-        let primary_key = format!("sub:{}", bark_id);
+    pub fn delete_subscription(&self, destination_id: &DestinationId) -> Result<()> {
+        let primary_key = subscription_key(destination_id);
         let _write_guard = self.lock_write_gate();
         if self.db.remove(primary_key.as_bytes())?.is_none() {
             return Err(anyhow!("订阅不存在"));
         }
         let mut cache = self.write_cache();
-        cache.by_bark_id.remove(bark_id);
+        cache.by_destination.remove(destination_id);
         cache.snapshot_dirty = true;
 
         tracing::info!(
             event = "subscription.deleted",
-            bark_id = %mask_bark_id(bark_id),
+            device_key = %mask_device_key(&destination_id.device_key),
             "subscription.deleted"
         );
         Ok(())
@@ -207,15 +215,19 @@ impl SubscriptionStore {
         visit_region_candidates(&index, regions, &mut seen, &mut visitor)
     }
 
-    pub fn for_each_bark_id<F>(&self, bark_ids: &HashSet<String>, mut visitor: F) -> Result<()>
+    pub fn for_each_destination<F>(
+        &self,
+        destinations: &HashSet<DestinationId>,
+        mut visitor: F,
+    ) -> Result<()>
     where
         F: FnMut(SubscriptionSnapshot) -> Result<()>,
     {
         let subscriptions = {
             let cache = self.read_cache();
-            bark_ids
+            destinations
                 .iter()
-                .filter_map(|bark_id| cache.by_bark_id.get(bark_id).cloned())
+                .filter_map(|destination| cache.by_destination.get(destination).cloned())
                 .collect::<Vec<_>>()
         };
         for subscription in subscriptions {
@@ -234,8 +246,8 @@ impl SubscriptionStore {
     {
         match query {
             SubscriptionCandidateQuery::All => self.for_each_subscription(visitor),
-            SubscriptionCandidateQuery::BarkIds(bark_ids) => {
-                self.for_each_bark_id(bark_ids, visitor)
+            SubscriptionCandidateQuery::Destinations(destinations) => {
+                self.for_each_destination(destinations, visitor)
             }
             SubscriptionCandidateQuery::Regions(regions) => {
                 self.for_each_in_regions(regions, visitor)
@@ -291,7 +303,7 @@ impl SubscriptionStore {
         if cache.snapshot_dirty {
             let snapshot = Arc::new(
                 cache
-                    .by_bark_id
+                    .by_destination
                     .values()
                     .cloned()
                     .collect::<Vec<Arc<Subscription>>>(),
@@ -304,7 +316,7 @@ impl SubscriptionStore {
     }
 
     pub fn get_total_count(&self) -> Result<usize> {
-        Ok(self.read_cache().by_bark_id.len())
+        Ok(self.read_cache().by_destination.len())
     }
 
     fn lock_write_gate(&self) -> MutexGuard<'_, ()> {
@@ -348,8 +360,8 @@ impl SubscriptionStore {
 
     pub fn is_current(&self, snapshot: &SubscriptionSnapshot) -> bool {
         self.read_cache()
-            .by_bark_id
-            .get(&snapshot.subscription.bark_id)
+            .by_destination
+            .get(&snapshot.subscription.destination_id())
             .is_some_and(|current| Arc::ptr_eq(current, &snapshot.version))
     }
 }
@@ -359,11 +371,13 @@ fn build_index(subscriptions: &[Arc<Subscription>]) -> SubscriptionIndex {
     for subscription in subscriptions {
         let mut cells = HashSet::new();
         let mut regions = HashSet::new();
-        subscription.for_each_normalized_location(|_name, latitude, longitude| {
-            cells.insert(grid_cell(latitude, longitude));
-        });
-        for location in &subscription.locations {
-            for value in [&location.province, &location.city, &location.district] {
+        for target in &subscription.targets {
+            cells.insert(grid_cell(target.point.latitude, target.point.longitude));
+            for value in [
+                &target.region.province,
+                &target.region.city,
+                &target.region.district,
+            ] {
                 let region = region::normalize(value);
                 if !region.is_empty() {
                     regions.insert(region);
@@ -393,7 +407,7 @@ fn visit_radius_candidates<F>(
     latitude: f64,
     longitude: f64,
     radius_km: f64,
-    seen: &mut HashSet<String>,
+    seen: &mut HashSet<DestinationId>,
     visitor: &mut F,
 ) -> Result<()>
 where
@@ -422,7 +436,7 @@ where
 fn visit_region_candidates<F>(
     index: &SubscriptionIndex,
     regions: &[String],
-    seen: &mut HashSet<String>,
+    seen: &mut HashSet<DestinationId>,
     visitor: &mut F,
 ) -> Result<()>
 where
@@ -438,7 +452,7 @@ where
             continue;
         };
         for subscription in subscriptions {
-            if seen.insert(subscription.bark_id.clone()) {
+            if seen.insert(subscription.destination_id()) {
                 visitor(SubscriptionSnapshot::new(Arc::clone(subscription)))?;
             }
         }
@@ -482,14 +496,14 @@ fn radius_cell_bounds(latitude: f64, longitude: f64, radius_km: f64) -> Option<R
 fn visit_cell<F>(
     index: &SubscriptionIndex,
     cell: (i16, i16),
-    seen: &mut HashSet<String>,
+    seen: &mut HashSet<DestinationId>,
     visitor: &mut F,
 ) -> Result<()>
 where
     F: FnMut(SubscriptionSnapshot) -> Result<()>,
 {
     for subscription in index.grid.get(&cell).into_iter().flatten() {
-        if seen.insert(subscription.bark_id.clone()) {
+        if seen.insert(subscription.destination_id()) {
             visitor(SubscriptionSnapshot::new(Arc::clone(subscription)))?;
         }
     }
@@ -501,23 +515,32 @@ fn normalize_longitude(longitude: f64) -> f64 {
 }
 
 fn mask_subscription_key(key: &[u8]) -> String {
-    let prefix = b"sub:";
-    if let Some(bark_id) = key.strip_prefix(prefix)
-        && let Ok(bark_id) = std::str::from_utf8(bark_id)
-    {
-        return mask_bark_id(bark_id);
-    }
-    "***".to_string()
+    String::from_utf8_lossy(key)
+        .rsplit(':')
+        .next()
+        .map(mask_device_key)
+        .unwrap_or_else(|| "***".to_string())
 }
 
-fn subscription_key_matches(key: &[u8], bark_id: &str) -> bool {
-    key.strip_prefix(b"sub:") == Some(bark_id.as_bytes())
+fn subscription_key(destination: &DestinationId) -> String {
+    format!(
+        "sub:{}:{}:{}",
+        destination.base_url.len(),
+        destination.base_url,
+        destination.device_key
+    )
+}
+
+fn subscription_key_matches(key: &[u8], destination: &DestinationId) -> bool {
+    key == subscription_key(destination).as_bytes()
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::models::{NotificationBand, SubscriptionLocation};
+    use crate::models::{
+        AdministrativeRegion, AlertRule, GeoPoint, MonitoringTarget, NotificationDestination,
+    };
     use std::sync::{MutexGuard, OnceLock};
 
     fn database_test_guard() -> Result<MutexGuard<'static, ()>> {
@@ -535,23 +558,32 @@ mod tests {
         SubscriptionStore::new(db)
     }
 
-    fn subscription(bark_id: &str, lat: f64, lon: f64) -> Subscription {
-        let locations = vec![SubscriptionLocation {
-            name: "home".to_string(),
-            latitude: lat,
-            longitude: lon,
-            province: String::new(),
-            city: String::new(),
-            district: String::new(),
-        }];
-        let mut subscription = Subscription::new(bark_id.to_string(), locations);
-        subscription.notify_bands = vec![NotificationBand {
-            min: 1,
-            max: 99,
-            level: "critical".to_string(),
-            label: String::new(),
-        }];
-        subscription
+    fn subscription(device_key: &str, lat: f64, lon: f64) -> Subscription {
+        Subscription::new(
+            NotificationDestination::Bark {
+                base_url: "https://api.day.app".to_string(),
+                device_key: device_key.to_string(),
+            },
+            vec![MonitoringTarget {
+                label: "home".to_string(),
+                point: GeoPoint {
+                    latitude: lat,
+                    longitude: lon,
+                },
+                region: AdministrativeRegion::default(),
+            }],
+            crate::models::DisasterCategory::ALL
+                .into_iter()
+                .map(AlertRule::default_for)
+                .collect(),
+        )
+    }
+
+    fn destination(device_key: &str) -> DestinationId {
+        DestinationId {
+            base_url: "https://api.day.app".to_string(),
+            device_key: device_key.to_string(),
+        }
     }
 
     fn collect_subscriptions(store: &SubscriptionStore) -> Result<Vec<Subscription>> {
@@ -573,13 +605,13 @@ mod tests {
         store.upsert_subscription(beijing)?;
         let found = collect_subscriptions(&store)?;
         anyhow::ensure!(found.len() == 1, "expected one beijing subscription");
-        anyhow::ensure!(found[0].bark_id == "abc123", "unexpected bark id");
+        anyhow::ensure!(found[0].device_key() == "abc123", "unexpected device key");
 
         store.upsert_subscription(shanghai)?;
         let updated = collect_subscriptions(&store)?;
         anyhow::ensure!(updated.len() == 1, "expected one updated subscription");
         anyhow::ensure!(
-            updated[0].locations[0].longitude == 121.4999,
+            updated[0].targets[0].point.longitude == 121.4999,
             "unexpected longitude"
         );
 
@@ -591,7 +623,7 @@ mod tests {
             "all subscriptions must be evaluated globally"
         );
 
-        store.delete_subscription("abc123")?;
+        store.delete_subscription(&destination("abc123"))?;
         let after_delete = collect_subscriptions(&store)?;
         anyhow::ensure!(
             after_delete.len() == 2,
@@ -610,8 +642,8 @@ mod tests {
             for index in 0..100_000 {
                 let subscription = subscription(&format!("device{index:06}"), 35.6762, 139.6503);
                 cache
-                    .by_bark_id
-                    .insert(subscription.bark_id.clone(), Arc::new(subscription));
+                    .by_destination
+                    .insert(subscription.destination_id(), Arc::new(subscription));
             }
             cache.snapshot_dirty = true;
         }
@@ -632,7 +664,7 @@ mod tests {
     #[test]
     fn display_names_do_not_create_administrative_region_matches() -> Result<()> {
         let mut named = subscription("device1", 30.0, 120.0);
-        named.locations[0].name = "北京".to_string();
+        named.targets[0].label = "北京".to_string();
         let index = build_index(&[Arc::new(named)]);
         let mut count = 0;
         visit_region_candidates(
@@ -719,12 +751,38 @@ mod tests {
             "replacement must be current"
         );
 
-        store.delete_subscription("device1")?;
+        store.delete_subscription(&destination("device1"))?;
         anyhow::ensure!(
             !store.is_current(&replacement),
             "delete must invalidate snapshot"
         );
 
+        Ok(())
+    }
+
+    #[test]
+    fn same_device_key_on_different_bark_servers_is_independent() -> Result<()> {
+        let _database_guard = database_test_guard()?;
+        let store = temporary_store()?;
+        let first = subscription("shared", 35.0, 105.0);
+        let mut second = subscription("shared", 36.0, 106.0);
+        second.destination = NotificationDestination::Bark {
+            base_url: "https://bark.example.com".to_string(),
+            device_key: "shared".to_string(),
+        };
+        let second_id = second.destination_id();
+
+        store.upsert_subscription(first)?;
+        store.upsert_subscription(second)?;
+        anyhow::ensure!(
+            store.get_total_count()? == 2,
+            "destinations must not collide"
+        );
+        store.delete_subscription(&second_id)?;
+        anyhow::ensure!(
+            store.get_total_count()? == 1,
+            "delete must be destination-scoped"
+        );
         Ok(())
     }
 }

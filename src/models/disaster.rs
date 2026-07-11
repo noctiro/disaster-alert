@@ -1,4 +1,7 @@
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+use serde::{Deserialize, Serialize};
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum DisasterCategory {
     EarthquakeWarning,
     EarthquakeReport,
@@ -8,6 +11,14 @@ pub enum DisasterCategory {
 }
 
 impl DisasterCategory {
+    pub const ALL: [Self; 5] = [
+        Self::EarthquakeWarning,
+        Self::EarthquakeReport,
+        Self::WeatherWarning,
+        Self::Tsunami,
+        Self::Typhoon,
+    ];
+
     pub fn as_str(self) -> &'static str {
         match self {
             Self::EarthquakeWarning => "earthquake_warning",
@@ -15,6 +26,16 @@ impl DisasterCategory {
             Self::WeatherWarning => "weather_warning",
             Self::Tsunami => "tsunami",
             Self::Typhoon => "typhoon",
+        }
+    }
+
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::EarthquakeWarning => "地震预警",
+            Self::EarthquakeReport => "地震速报",
+            Self::WeatherWarning => "气象预警",
+            Self::Tsunami => "海啸预警",
+            Self::Typhoon => "台风信息",
         }
     }
 }

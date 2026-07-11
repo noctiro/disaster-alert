@@ -5,6 +5,7 @@ use anyhow::Result;
 use futures_util::{SinkExt, StreamExt};
 use std::collections::HashMap;
 use std::time::Duration;
+use tokio::sync::watch;
 use tokio_tungstenite::{
     connect_async_with_config,
     tungstenite::{Message, protocol::WebSocketConfig},
@@ -36,11 +37,15 @@ impl FanStudioSource {
         }
     }
 
-    pub async fn run(&self) -> Result<()> {
+    pub async fn run(&self, mut shutdown: watch::Receiver<bool>) -> Result<()> {
         let mut delay = self.reconnect_min;
         loop {
-            match self.connect_once(&mut delay).await {
-                Ok(()) => delay = self.reconnect_min,
+            if *shutdown.borrow() {
+                break;
+            }
+            match self.connect_once(&mut delay, &mut shutdown).await {
+                Ok(true) => break,
+                Ok(false) => delay = self.reconnect_min,
                 Err(error) => tracing::error!(
                     event = "fanstudio.websocket_error",
                     error = ?error,
@@ -49,13 +54,27 @@ impl FanStudioSource {
             }
             self.runtime_status.fanstudio().set_connected(false);
             self.runtime_status.fanstudio().record_reconnect();
-            tokio::time::sleep(delay).await;
+            tokio::select! {
+                biased;
+                result = shutdown.changed() => {
+                    if result.is_err() || *shutdown.borrow() {
+                        break;
+                    }
+                }
+                () = tokio::time::sleep(delay) => {}
+            }
             delay = delay.saturating_mul(2).min(self.reconnect_max);
         }
+        self.runtime_status.fanstudio().set_connected(false);
+        Ok(())
     }
 
-    async fn connect_once(&self, delay: &mut Duration) -> Result<()> {
-        let (socket, _) = tokio::time::timeout(
+    async fn connect_once(
+        &self,
+        delay: &mut Duration,
+        shutdown: &mut watch::Receiver<bool>,
+    ) -> Result<bool> {
+        let connect = tokio::time::timeout(
             Duration::from_secs(10),
             connect_async_with_config(
                 &self.websocket_url,
@@ -66,9 +85,15 @@ impl FanStudioSource {
                 ),
                 false,
             ),
-        )
-        .await
-        .map_err(|error| anyhow::anyhow!("Fan Studio connection timed out: {error}"))??;
+        );
+        let (socket, _) = tokio::select! {
+            biased;
+            result = shutdown.changed() => {
+                return Ok(result.is_err() || *shutdown.borrow());
+            }
+            result = connect => result
+                .map_err(|error| anyhow::anyhow!("Fan Studio connection timed out: {error}"))??,
+        };
         *delay = self.reconnect_min;
         self.runtime_status.fanstudio().set_connected(true);
         // A completed handshake proves the transport is healthy; do not retain outage backoff.
@@ -80,9 +105,20 @@ impl FanStudioSource {
         let (mut write, mut read) = socket.split();
         let mut source_md5 = HashMap::new();
         loop {
-            let message = tokio::time::timeout(Duration::from_secs(90), read.next())
-                .await
-                .map_err(|error| anyhow::anyhow!("Fan Studio heartbeat timed out: {error}"))?;
+            if *shutdown.borrow() {
+                return Ok(true);
+            }
+            let message = tokio::select! {
+                biased;
+                result = tokio::time::timeout(Duration::from_secs(90), read.next()) => result
+                    .map_err(|error| anyhow::anyhow!("Fan Studio heartbeat timed out: {error}"))?,
+                result = shutdown.changed() => {
+                    if result.is_err() || *shutdown.borrow() {
+                        return Ok(true);
+                    }
+                    continue;
+                }
+            };
             let Some(message) = message else { break };
             match message? {
                 Message::Text(text) => {
@@ -100,7 +136,23 @@ impl FanStudioSource {
                         }
                     };
                     match envelope.get("type").and_then(serde_json::Value::as_str) {
-                        Some("heartbeat") => write.send(Message::Text("ping".into())).await?,
+                        Some("heartbeat") => {
+                            let send = tokio::time::timeout(
+                                Duration::from_secs(10),
+                                write.send(Message::Text("ping".into())),
+                            );
+                            tokio::select! {
+                                biased;
+                                result = shutdown.changed() => {
+                                    if result.is_err() || *shutdown.borrow() {
+                                        return Ok(true);
+                                    }
+                                }
+                                result = send => {
+                                    result.map_err(|error| anyhow::anyhow!("Fan Studio heartbeat response timed out: {error}"))??;
+                                }
+                            }
+                        }
                         Some("initial_all" | "query_response") => {
                             self.submit_snapshot(&envelope, &mut source_md5).await
                         }
@@ -133,7 +185,7 @@ impl FanStudioSource {
                 _ => {}
             }
         }
-        Ok(())
+        Ok(false)
     }
 
     async fn submit_snapshot(

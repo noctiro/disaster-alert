@@ -19,6 +19,7 @@ pub fn load_dotenv() -> Result<Option<PathBuf>> {
 pub struct Config {
     pub server_host: String,
     pub server_port: u16,
+    pub shutdown_timeout_seconds: u64,
     pub allowed_origins: Vec<String>,
     pub db_path: String,
     /// Ordered, normalized Bark server roots.
@@ -53,6 +54,7 @@ impl Config {
         let config = Self {
             server_host: env_string("SERVER_HOST", "0.0.0.0"),
             server_port: env_parse("SERVER_PORT", 30010)?,
+            shutdown_timeout_seconds: env_parse("SHUTDOWN_TIMEOUT_SECONDS", 15)?,
             allowed_origins: env_list("ALLOWED_ORIGINS"),
             db_path: env_string("DB_PATH", "./data/disaster-alert.db"),
             bark_url_allowlist: bark_url_allowlist()?,
@@ -99,6 +101,9 @@ impl Config {
         )?;
         if self.reconnect_min_seconds == 0 {
             bail!("RECONNECT_MIN_SECONDS must be greater than 0");
+        }
+        if self.shutdown_timeout_seconds == 0 || self.shutdown_timeout_seconds > 300 {
+            bail!("SHUTDOWN_TIMEOUT_SECONDS must be in 1..=300");
         }
         if self.reconnect_min_seconds > self.reconnect_max_seconds {
             bail!("RECONNECT_MIN_SECONDS must be <= RECONNECT_MAX_SECONDS");

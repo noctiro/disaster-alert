@@ -28,6 +28,7 @@ flowchart LR
 - `providers/` 是供应商边界。每个适配器只负责 WebSocket 生命周期、供应商协议解析和 `DisasterEvent` 标准化，不访问数据库或 Bark
 - `models/` 只包含共享灾害事件和当前订阅格式，不包含 Wolfx 或 FAN Studio 协议结构
 - `source_registry.rs` 是来源 ID、渠道、灾种和前端来源选项的唯一注册表
+- `lifecycle.rs` 统一管理进程信号、HTTP/provider/dispatcher 的关停顺序、任务回收和 sled 刷新
 - `DisasterDispatcher` 统一执行有界队列、跨渠道聚合、候选订阅索引查询、精确匹配、并发通知和有限重试
 - 队列满时对来源施加背压，并按事件版本合并更新，不丢弃已有预警；`/api/status` 可观察连接和背压计数
 - `EventAggregator` 只处理跨渠道事件关联与投递版本，不包含供应商协议判断
@@ -42,6 +43,7 @@ flowchart LR
 
 ```text
 src/                   Rust 应用源代码
+src/lifecycle.rs       进程生命周期和优雅关停协调器
 web/index.html         Web 界面源文件
 build.rs               构建时压缩 Web 界面并写入 OUT_DIR
 Cargo.toml             Rust crate 和构建配置
@@ -59,6 +61,8 @@ cargo build --release
 ```
 
 默认监听 `0.0.0.0:30010`，浏览器访问 `http://your-server:30010` 即可使用。生产环境建议将 `SERVER_HOST` 设为 `127.0.0.1`，再由运行环境已有的反向代理提供 HTTPS；进程守护、域名和证书配置也由实际运行环境管理。
+
+sled 是本地嵌入式数据库：部署时必须持久化 `DB_PATH` 所在目录，且同一数据库目录只能由一个服务实例打开。当前版本不支持多个容器共享该数据库或水平扩容；`/health` 是唯一健康探针，只表示 HTTP 服务可响应。
 
 ## 配置
 
@@ -78,6 +82,7 @@ vim .env
 | --- | --- | --- |
 | `SERVER_HOST` | `0.0.0.0` | 监听地址 |
 | `SERVER_PORT` | `30010` | 服务端口 |
+| `SHUTDOWN_TIMEOUT_SECONDS` | `15` | 任务排空的最长等待秒数，也是最终数据库刷新超时失败的判定阈值，范围 `1..=300`；已开始的刷新仍会完成后再退出 |
 | `ALLOWED_ORIGINS` | (空) | 允许跨域访问 API 的前端 Origin，多个值用逗号分隔；空表示不额外开放跨域 |
 | `DB_PATH` | `./data/disaster-alert.db` | 灾害订阅数据库路径 |
 | `BARK_URL_ALLOWLIST` | `https://api.day.app` | 前端可选的 Bark 基础 URL 有序白名单，支持 HTTP/HTTPS、端口、IP 和反代子路径；多个值用逗号分隔 |

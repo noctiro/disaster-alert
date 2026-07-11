@@ -125,6 +125,12 @@ impl SubscriptionStore {
         })
     }
 
+    pub(crate) fn flush(&self) -> Result<()> {
+        let _write_guard = self.lock_write_gate();
+        self.db.flush()?;
+        Ok(())
+    }
+
     pub fn upsert_subscription(&self, mut subscription: Subscription) -> Result<()> {
         subscription
             .validate()

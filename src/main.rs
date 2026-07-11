@@ -1,5 +1,6 @@
 mod config;
 mod db;
+mod lifecycle;
 mod models;
 mod providers;
 mod routes;
@@ -49,11 +50,13 @@ fn main() -> Result<()> {
         tracing::info!(event = "config.dotenv_loaded", path = %path.display(), "config.dotenv_loaded");
     }
 
-    tokio::runtime::Builder::new_multi_thread()
+    let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()
-        .context("failed to create Tokio runtime")?
-        .block_on(run())
+        .context("failed to create Tokio runtime")?;
+    let result = runtime.block_on(run());
+    runtime.shutdown_timeout(lifecycle::FORCED_SHUTDOWN_TIMEOUT);
+    result
 }
 
 async fn run() -> Result<()> {
@@ -129,6 +132,10 @@ async fn run() -> Result<()> {
 
     tracing::info!(event = "server.starting", listen_addr = %addr, "server.starting");
 
+    let listener = tokio::net::TcpListener::bind(&addr)
+        .await
+        .context("failed to bind HTTP listener")?;
+
     let dedup_keep_seconds = config
         .dedup_keep_minutes
         .checked_mul(60)
@@ -142,44 +149,17 @@ async fn run() -> Result<()> {
         runtime_status.clone(),
     );
     let wolfx = WolfxSource::new(&config, dispatcher.clone(), runtime_status.clone());
-    let fanstudio = FanStudioSource::new(&config, dispatcher.clone(), runtime_status);
-    let dispatcher_handle = tokio::spawn(async move { dispatcher.run().await });
-    let wolfx_handle = tokio::spawn(async move { wolfx.run().await });
-    let fanstudio_handle = tokio::spawn(async move { fanstudio.run().await });
-
-    let listener = tokio::net::TcpListener::bind(&addr)
-        .await
-        .context("failed to bind HTTP listener")?;
-    let server = axum::serve(listener, app);
-
-    tokio::select! {
-        result = server => {
-            result.context("HTTP server failed")?;
-        }
-        result = dispatcher_handle => {
-            match result {
-                Ok(Ok(())) => tracing::warn!(event = "dispatcher.task_finished", "dispatcher.task_finished"),
-                Ok(Err(error)) => return Err(error).context("dispatcher task failed"),
-                Err(error) => return Err(error).context("dispatcher task panicked"),
-            }
-        }
-        result = wolfx_handle => {
-            match result {
-                Ok(Ok(())) => anyhow::bail!("Wolfx provider terminated unexpectedly"),
-                Ok(Err(error)) => return Err(error).context("Wolfx provider failed"),
-                Err(error) => return Err(error).context("Wolfx provider panicked"),
-            }
-        }
-        result = fanstudio_handle => {
-            match result {
-                Ok(Ok(())) => anyhow::bail!("Fan Studio provider terminated unexpectedly"),
-                Ok(Err(error)) => return Err(error).context("Fan Studio provider failed"),
-                Err(error) => return Err(error).context("Fan Studio provider panicked"),
-            }
-        }
-    }
-
-    Ok(())
+    let fanstudio = FanStudioSource::new(&config, dispatcher.clone(), runtime_status.clone());
+    lifecycle::run_until_shutdown(
+        listener,
+        app,
+        db,
+        dispatcher,
+        wolfx,
+        fanstudio,
+        Duration::from_secs(config.shutdown_timeout_seconds),
+    )
+    .await
 }
 
 fn build_cors_layer(config: &Config) -> Result<CorsLayer> {

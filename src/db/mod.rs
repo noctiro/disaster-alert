@@ -28,4 +28,13 @@ impl Database {
     pub fn subscriptions(&self) -> SubscriptionStore {
         self.subscriptions.clone()
     }
+
+    /// Persist all pending database writes before process shutdown.
+    pub async fn flush(&self) -> Result<()> {
+        let subscriptions = self.subscriptions.clone();
+        tokio::task::spawn_blocking(move || subscriptions.flush())
+            .await
+            .context("database flush task failed")??;
+        Ok(())
+    }
 }

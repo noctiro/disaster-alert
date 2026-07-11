@@ -67,6 +67,7 @@ struct EventQueue {
 
 #[derive(Default)]
 struct EventQueueState {
+    closed: bool,
     order: VecDeque<String>,
     pending: HashMap<String, QueuedEvent>,
     latest: HashMap<String, QueuedEvent>,
@@ -156,22 +157,38 @@ impl DisasterDispatcher {
         self.submit_nonblocking_batch(accepted).await
     }
 
+    pub async fn close(&self) {
+        self.inner.queue.close().await;
+    }
+
     pub async fn run(&self) -> Result<()> {
         let mut workers = tokio::task::JoinSet::new();
         for _ in 0..self.inner.event_workers {
             let dispatcher = self.clone();
             workers.spawn(async move { dispatcher.run_worker().await });
         }
-        match workers.join_next().await {
-            Some(Ok(result)) => result,
-            Some(Err(error)) => Err(anyhow::anyhow!("dispatcher worker failed: {error}")),
-            None => anyhow::bail!("dispatcher started without workers"),
+        let mut errors = Vec::new();
+        while let Some(result) = workers.join_next().await {
+            match result {
+                Ok(Ok(())) => {}
+                Ok(Err(error)) => {
+                    self.inner.queue.close().await;
+                    errors.push(error);
+                }
+                Err(error) => {
+                    self.inner.queue.close().await;
+                    errors.push(anyhow::anyhow!("dispatcher worker failed: {error}"));
+                }
+            }
         }
+        finish_worker_results(errors)
     }
 
     async fn run_worker(&self) -> Result<()> {
         loop {
-            let mut queued = self.inner.queue.pop().await;
+            let Some(mut queued) = self.inner.queue.pop().await else {
+                return Ok(());
+            };
             if let Err(error) = self.inner.dispatch(&queued).await {
                 tracing::error!(
                     event = "dispatcher.delivery_failed",
@@ -186,7 +203,7 @@ impl DisasterDispatcher {
                         .retry_delay
                         .saturating_mul(1u32 << u32::from(queued.attempts.min(5) - 1));
                     tokio::time::sleep(delay.min(Duration::from_secs(30))).await;
-                    self.inner.queue.push(queued).await;
+                    self.inner.queue.push_retry(queued).await;
                 } else {
                     tracing::error!(
                         event = "dispatcher.delivery_abandoned",
@@ -197,6 +214,22 @@ impl DisasterDispatcher {
                 }
             }
         }
+    }
+}
+
+fn finish_worker_results(mut errors: Vec<anyhow::Error>) -> Result<()> {
+    let mut errors = errors.drain(..);
+    let Some(first) = errors.next() else {
+        return Ok(());
+    };
+    let additional = errors.map(|error| format!("{error:#}")).collect::<Vec<_>>();
+    if additional.is_empty() {
+        Err(first)
+    } else {
+        Err(first.context(format!(
+            "additional dispatcher worker failures: {}",
+            additional.join("; ")
+        )))
     }
 }
 
@@ -360,11 +393,28 @@ impl EventQueue {
         }
     }
 
-    async fn push(&self, mut queued: QueuedEvent) {
+    #[cfg(test)]
+    async fn push(&self, queued: QueuedEvent) -> bool {
+        self.push_with_options(queued, false, false).await
+    }
+
+    async fn push_retry(&self, queued: QueuedEvent) {
+        let _accepted = self.push_with_options(queued, true, true).await;
+    }
+
+    async fn push_with_options(
+        &self,
+        mut queued: QueuedEvent,
+        allow_closed: bool,
+        allow_over_capacity: bool,
+    ) -> bool {
         let key = queued.event.event_key();
         loop {
             let notified = self.space.notified();
             let mut state = self.state.lock().await;
+            if state.closed && !allow_closed {
+                return false;
+            }
             if queued.sequence == 0 {
                 state.next_sequence = state.next_sequence.wrapping_add(1).max(1);
                 queued.sequence = state.next_sequence;
@@ -373,19 +423,19 @@ impl EventQueue {
                 && (latest.sequence > queued.sequence
                     || !event_supersedes_or_matches(&latest.event, &queued.event))
             {
-                return;
+                return true;
             }
             if let Some(current) = state.pending.get(&key) {
                 if current.sequence > queued.sequence
                     || !event_supersedes(&current.event, &queued.event)
                 {
-                    return;
+                    return true;
                 }
                 state.record_latest(key.clone(), queued.clone(), self.capacity.saturating_mul(4));
                 state.pending.insert(key, queued);
-                return;
+                return true;
             }
-            if state.pending.len() < self.capacity {
+            if state.pending.len() < self.capacity || allow_over_capacity {
                 state.record_latest(key.clone(), queued.clone(), self.capacity.saturating_mul(4));
                 state.order.push_back(key.clone());
                 state.increment(event_channel(&queued.event));
@@ -393,7 +443,7 @@ impl EventQueue {
                 state.publish_depths(&self.runtime_status);
                 drop(state);
                 self.ready.notify_one();
-                return;
+                return true;
             }
             self.runtime_status
                 .channel(event_channel(&queued.event))
@@ -408,6 +458,9 @@ impl EventQueue {
             return true;
         }
         let mut state = self.state.lock().await;
+        if state.closed {
+            return false;
+        }
         let mut staged = HashMap::<String, QueuedEvent>::with_capacity(queued.len());
         let mut staged_order = Vec::with_capacity(queued.len());
 
@@ -467,7 +520,7 @@ impl EventQueue {
         true
     }
 
-    async fn pop(&self) -> QueuedEvent {
+    async fn pop(&self) -> Option<QueuedEvent> {
         loop {
             let notified = self.ready.notified();
             {
@@ -477,12 +530,26 @@ impl EventQueue {
                         state.decrement(event_channel(&queued.event));
                         state.publish_depths(&self.runtime_status);
                         self.space.notify_one();
-                        return queued;
+                        return Some(queued);
                     }
+                }
+                if state.closed {
+                    return None;
                 }
             }
             notified.await;
         }
+    }
+
+    async fn close(&self) {
+        let mut state = self.state.lock().await;
+        if state.closed {
+            return;
+        }
+        state.closed = true;
+        drop(state);
+        self.ready.notify_waiters();
+        self.space.notify_waiters();
     }
 }
 
@@ -923,7 +990,7 @@ mod tests {
             })
             .await;
         queue.push(first).await;
-        assert_eq!(queue.pop().await.event.report_num, 3);
+        assert_eq!(queue.pop().await.map(|item| item.event.report_num), Some(3));
     }
 
     #[tokio::test]
@@ -938,6 +1005,10 @@ mod tests {
         };
         queue.push(first).await;
         let stale_retry = queue.pop().await;
+        assert!(stale_retry.is_some());
+        let Some(stale_retry) = stale_retry else {
+            return;
+        };
         queue
             .push(QueuedEvent {
                 event: event(DisasterCategory::EarthquakeWarning, 3),
@@ -947,7 +1018,7 @@ mod tests {
                 queued_at: Instant::now(),
             })
             .await;
-        assert_eq!(queue.pop().await.event.report_num, 3);
+        assert_eq!(queue.pop().await.map(|item| item.event.report_num), Some(3));
         queue.push(stale_retry).await;
         let state = queue.state.lock().await;
         assert!(state.pending.is_empty());
@@ -1014,9 +1085,74 @@ mod tests {
         });
         tokio::task::yield_now().await;
         assert!(!blocked.is_finished());
-        queue.pop().await;
+        assert!(queue.pop().await.is_some());
         assert!(blocked.await.is_ok());
-        assert_eq!(queue.pop().await.event.event_id, "event-2");
+        assert_eq!(
+            queue.pop().await.map(|item| item.event.event_id),
+            Some("event-2".to_string())
+        );
         assert_eq!(status.snapshot().fanstudio.queue_backpressure, 1);
+    }
+
+    #[tokio::test]
+    async fn closed_queue_drains_existing_events_and_rejects_new_events() {
+        let queue = EventQueue::new(2, RuntimeStatus::default());
+        let existing = QueuedEvent {
+            event: event(DisasterCategory::EarthquakeWarning, 1),
+            incident_id: 1,
+            sequence: 0,
+            attempts: 0,
+            queued_at: Instant::now(),
+        };
+        assert!(queue.push(existing.clone()).await);
+        queue.close().await;
+        assert!(!queue.push(existing).await);
+        assert!(queue.pop().await.is_some());
+        assert!(queue.pop().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn closed_queue_accepts_retries_for_in_flight_events() {
+        let queue = EventQueue::new(2, RuntimeStatus::default());
+        let retry = QueuedEvent {
+            event: event(DisasterCategory::EarthquakeWarning, 1),
+            incident_id: 1,
+            sequence: 0,
+            attempts: 1,
+            queued_at: Instant::now(),
+        };
+        queue.close().await;
+        queue.push_retry(retry).await;
+        assert!(queue.pop().await.is_some());
+        assert!(queue.pop().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn retry_does_not_wait_when_the_queue_is_full() {
+        let queue = EventQueue::new(1, RuntimeStatus::default());
+        assert!(
+            queue
+                .push(QueuedEvent {
+                    event: event(DisasterCategory::EarthquakeWarning, 1),
+                    incident_id: 1,
+                    sequence: 0,
+                    attempts: 0,
+                    queued_at: Instant::now(),
+                })
+                .await
+        );
+        let mut retry_event = event(DisasterCategory::EarthquakeWarning, 1);
+        retry_event.event_id = "event-2".to_string();
+        queue
+            .push_retry(QueuedEvent {
+                event: retry_event,
+                incident_id: 2,
+                sequence: 0,
+                attempts: 1,
+                queued_at: Instant::now(),
+            })
+            .await;
+        assert!(queue.pop().await.is_some());
+        assert!(queue.pop().await.is_some());
     }
 }

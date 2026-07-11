@@ -10,6 +10,7 @@ mod utils;
 use anyhow::{Context, Result};
 use axum::{
     Router,
+    extract::DefaultBodyLimit,
     http::{HeaderValue, Method},
     routing::{delete, get, post},
 };
@@ -29,6 +30,8 @@ use std::net::SocketAddr;
 use std::time::Duration;
 use tower_http::cors::CorsLayer;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
+
+const SUBSCRIPTION_BODY_LIMIT_BYTES: usize = 32 * 1024;
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -86,14 +89,20 @@ async fn main() -> Result<()> {
         .route("/", get(index_handler))
         .route("/index.html", get(index_handler))
         .route("/health", get(health_handler))
-        .route("/api/subscribe", post(subscribe_handler))
+        .route(
+            "/api/subscribe",
+            post(subscribe_handler).layer(DefaultBodyLimit::max(SUBSCRIPTION_BODY_LIMIT_BYTES)),
+        )
         .route("/api/bark-urls", get(bark_urls_handler))
         .route("/api/reverse-geocode", get(reverse_geocode_handler))
         .route(
             "/api/subscription-options",
             get(subscription_options_handler),
         )
-        .route("/api/unsubscribe", delete(unsubscribe_handler))
+        .route(
+            "/api/unsubscribe",
+            delete(unsubscribe_handler).layer(DefaultBodyLimit::max(SUBSCRIPTION_BODY_LIMIT_BYTES)),
+        )
         .route("/api/stats", get(stats_handler))
         .route("/api/status", get(status_handler))
         .layer(cors)

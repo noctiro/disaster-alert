@@ -534,7 +534,9 @@ impl EventQueueState {
 }
 
 fn event_supersedes(current: &DisasterEvent, candidate: &DisasterEvent) -> bool {
-    if current.cancel && !candidate.cancel || current.final_report && !candidate.final_report {
+    if current.cancel && !candidate.cancel
+        || current.final_report && !candidate.final_report && !candidate.cancel
+    {
         return false;
     }
     if candidate.report_num != current.report_num {
@@ -975,6 +977,12 @@ mod tests {
         post_cancel.report_num = 4;
         post_cancel.revision = "4".to_string();
         assert!(!event_supersedes(&cancelled, &post_cancel));
+
+        let mut final_report = event(DisasterCategory::EarthquakeWarning, 4);
+        final_report.final_report = true;
+        let mut final_cancel = final_report.clone();
+        final_cancel.cancel = true;
+        assert!(event_supersedes(&final_report, &final_cancel));
     }
 
     #[tokio::test]

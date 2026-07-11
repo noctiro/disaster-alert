@@ -10,6 +10,7 @@ use url::Url;
 const CACHE_TTL: Duration = Duration::from_secs(24 * 60 * 60);
 const MIN_REQUEST_INTERVAL: Duration = Duration::from_secs(1);
 const MAX_CACHE_ENTRIES: usize = 1_024;
+const MAX_RESPONSE_BYTES: usize = 64 * 1024;
 
 #[derive(Debug, Clone, Serialize)]
 pub struct ReverseGeocodeResult {
@@ -89,20 +90,35 @@ impl ReverseGeocoder {
             bail!("reverse geocoding is disabled");
         }
         let key = CoordinateKey::new(latitude, longitude)?;
-        let mut state = self.state.lock().await;
-        if let Some(entry) = state.cache.get(&key)
-            && entry.stored_at.elapsed() <= CACHE_TTL
-        {
-            return Ok(entry.value.clone());
+        loop {
+            let delay = {
+                let mut state = self.state.lock().await;
+                if let Some(entry) = state.cache.get(&key)
+                    && entry.stored_at.elapsed() <= CACHE_TTL
+                {
+                    return Ok(entry.value.clone());
+                }
+                match state.last_request {
+                    Some(last_request) => {
+                        let elapsed = last_request.elapsed();
+                        if elapsed < MIN_REQUEST_INTERVAL {
+                            Some(MIN_REQUEST_INTERVAL - elapsed)
+                        } else {
+                            state.last_request = Some(Instant::now());
+                            None
+                        }
+                    }
+                    None => {
+                        state.last_request = Some(Instant::now());
+                        None
+                    }
+                }
+            };
+            let Some(delay) = delay else {
+                break;
+            };
+            tokio::time::sleep(delay).await;
         }
-        if let Some(last_request) = state.last_request {
-            let elapsed = last_request.elapsed();
-            if elapsed < MIN_REQUEST_INTERVAL {
-                tokio::time::sleep(MIN_REQUEST_INTERVAL - elapsed).await;
-            }
-        }
-        state.last_request = Some(Instant::now());
-        drop(state);
 
         let mut url = self.endpoint.clone();
         url.query_pairs_mut()
@@ -119,10 +135,8 @@ impl ReverseGeocoder {
             .await
             .context("reverse geocoding request failed")?
             .error_for_status()
-            .context("reverse geocoding service returned an error")?
-            .json::<NominatimResponse>()
-            .await
-            .context("invalid reverse geocoding response")?;
+            .context("reverse geocoding service returned an error")?;
+        let response = limited_response_json(response).await?;
         let value = response.address.into_result();
 
         let mut state = self.state.lock().await;
@@ -142,6 +156,27 @@ impl ReverseGeocoder {
         }
         Ok(value)
     }
+}
+
+async fn limited_response_json(mut response: reqwest::Response) -> Result<NominatimResponse> {
+    if response
+        .content_length()
+        .is_some_and(|length| length > MAX_RESPONSE_BYTES as u64)
+    {
+        bail!("reverse geocoding response exceeded size limit");
+    }
+    let mut body = Vec::new();
+    while let Some(chunk) = response
+        .chunk()
+        .await
+        .context("failed to read reverse geocoding response")?
+    {
+        if body.len().saturating_add(chunk.len()) > MAX_RESPONSE_BYTES {
+            bail!("reverse geocoding response exceeded size limit");
+        }
+        body.extend_from_slice(&chunk);
+    }
+    serde_json::from_slice(&body).context("invalid reverse geocoding response")
 }
 
 impl CoordinateKey {
@@ -186,7 +221,13 @@ fn first_non_empty<const N: usize>(values: [Option<String>; N]) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{CoordinateKey, NominatimAddress};
+    use super::{
+        CoordinateKey, GeocoderState, MIN_REQUEST_INTERVAL, NominatimAddress, ReverseGeocoder,
+    };
+    use std::sync::Arc;
+    use std::time::{Duration, Instant};
+    use tokio::sync::Mutex;
+    use url::Url;
 
     #[test]
     fn maps_nominatim_address_fallbacks() -> anyhow::Result<()> {
@@ -216,6 +257,32 @@ mod tests {
             CoordinateKey::new(35.12344, 139.12344)? == CoordinateKey::new(35.12343, 139.12343)?
         );
         anyhow::ensure!(CoordinateKey::new(91.0, 0.0).is_err());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn rate_limit_wait_does_not_hold_the_state_lock() -> anyhow::Result<()> {
+        let state = Arc::new(Mutex::new(GeocoderState {
+            last_request: Some(Instant::now()),
+            ..GeocoderState::default()
+        }));
+        let geocoder = ReverseGeocoder {
+            enabled: true,
+            endpoint: Url::parse("http://127.0.0.1:9/reverse")?,
+            client: reqwest::Client::new(),
+            state: Arc::clone(&state),
+        };
+        let task = tokio::spawn(async move { geocoder.resolve(35.0, 105.0).await });
+        tokio::task::yield_now().await;
+
+        let guard = tokio::time::timeout(Duration::from_millis(100), state.lock()).await?;
+        drop(guard);
+        task.abort();
+        anyhow::ensure!(
+            matches!(task.await, Err(error) if error.is_cancelled()),
+            "aborted reverse geocoding task must report cancellation"
+        );
+        anyhow::ensure!(MIN_REQUEST_INTERVAL > Duration::from_millis(100));
         Ok(())
     }
 }

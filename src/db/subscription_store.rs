@@ -3,6 +3,7 @@ use crate::utils::region;
 use anyhow::{Result, anyhow};
 use sled::Db;
 use std::collections::{HashMap, HashSet};
+use std::fmt;
 use std::sync::{Arc, Mutex, MutexGuard, RwLock, RwLockReadGuard, RwLockWriteGuard};
 
 #[derive(Clone)]
@@ -62,6 +63,17 @@ pub enum StoreErrorKind {
     NotFound,
     Internal,
 }
+
+#[derive(Debug)]
+struct SubscriptionNotFound;
+
+impl fmt::Display for SubscriptionNotFound {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("订阅不存在")
+    }
+}
+
+impl std::error::Error for SubscriptionNotFound {}
 
 impl SubscriptionStore {
     pub(crate) fn new(db: Db) -> Result<Self> {
@@ -151,7 +163,7 @@ impl SubscriptionStore {
         let primary_key = subscription_key(destination_id);
         let _write_guard = self.lock_write_gate();
         if self.db.remove(primary_key.as_bytes())?.is_none() {
-            return Err(anyhow!("订阅不存在"));
+            return Err(SubscriptionNotFound.into());
         }
         let mut cache = self.write_cache();
         cache.by_destination.remove(destination_id);
@@ -166,7 +178,7 @@ impl SubscriptionStore {
     }
 
     pub fn classify_error(error: &anyhow::Error) -> StoreErrorKind {
-        if error.to_string().contains("订阅不存在") {
+        if error.downcast_ref::<SubscriptionNotFound>().is_some() {
             StoreErrorKind::NotFound
         } else {
             StoreErrorKind::Internal
@@ -782,6 +794,22 @@ mod tests {
         anyhow::ensure!(
             store.get_total_count()? == 1,
             "delete must be destination-scoped"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn missing_subscription_uses_a_typed_not_found_error() -> Result<()> {
+        let _database_guard = database_test_guard()?;
+        let store = temporary_store()?;
+        let error = match store.delete_subscription(&destination("missing")) {
+            Ok(()) => anyhow::bail!("expected deletion to fail"),
+            Err(error) => error,
+        };
+
+        anyhow::ensure!(
+            SubscriptionStore::classify_error(&error) == StoreErrorKind::NotFound,
+            "missing subscriptions must map to 404 independently of error text"
         );
         Ok(())
     }

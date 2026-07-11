@@ -206,6 +206,7 @@ set -a; . ./.env; set +a
 - 地震速报沿用全局候选订阅匹配；天气、海啸和台风的空间匹配分别由规则字段决定
 - `/api/subscription-options` 返回按灾种组织的来源目录及每种规则的完整默认值，Web 界面以此生成配置
 - 订阅身份是 `destination.base_url` 与 `destination.device_key` 的组合；同一 Key 可用于不同 Bark 服务，分别保存和删除
+- 订阅和退订 JSON 请求体上限为 32 KiB；超限或结构无效时返回统一 JSON `400`
 
 成功响应：
 

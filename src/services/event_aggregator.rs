@@ -364,8 +364,20 @@ fn earthquake_match_score(
     )
 }
 
-fn update_incident(incident: &mut Incident, _event: &DisasterEvent, now: Instant) {
-    // Preserve the original correlation anchor so nearby events cannot chain together.
+fn update_incident(incident: &mut Incident, event: &DisasterEvent, now: Instant) {
+    // Preserve the original correlation anchor while filling gaps from later same-source reports.
+    if incident.occurred_epoch.is_none() {
+        incident.occurred_epoch = parse_event_epoch(event);
+    }
+    if incident.latitude.is_none() {
+        incident.latitude = event.latitude;
+    }
+    if incident.longitude.is_none() {
+        incident.longitude = event.longitude;
+    }
+    if incident.magnitude.is_none() {
+        incident.magnitude = event.magnitude;
+    }
     incident.at = now;
 }
 
@@ -432,7 +444,9 @@ fn is_meaningful_update(
     if event.source != previous.source {
         return safety_transition;
     }
-    if previous.cancel && !event.cancel || previous.final_report && !event.final_report {
+    if previous.cancel && !event.cancel
+        || previous.final_report && !event.final_report && !event.cancel
+    {
         return false;
     }
     if event.report_num < previous.report_num {
@@ -897,5 +911,67 @@ mod tests {
                 .await
                 .is_acquired()
         );
+    }
+
+    #[tokio::test]
+    async fn cancellation_after_a_final_report_is_delivered() {
+        let aggregator = EventAggregator::new(Duration::from_secs(60));
+        let mut final_report = earthquake("wolfx.jma_eew", "a", 2, 35.0);
+        final_report.final_report = true;
+        let mut cancelled = final_report.clone();
+        cancelled.cancel = true;
+        let incident = aggregator.correlate(&final_report).await;
+        let permit = match aggregator
+            .begin_delivery(
+                incident,
+                destination("device"),
+                String::new(),
+                &final_report,
+                true,
+                1,
+            )
+            .await
+        {
+            DeliveryAttempt::Acquired(permit) => permit,
+            other => {
+                assert!(matches!(other, DeliveryAttempt::Acquired(_)));
+                return;
+            }
+        };
+        permit.commit().await;
+
+        assert!(
+            aggregator
+                .begin_delivery(
+                    incident,
+                    destination("device"),
+                    String::new(),
+                    &cancelled,
+                    true,
+                    1
+                )
+                .await
+                .is_acquired()
+        );
+    }
+
+    #[tokio::test]
+    async fn later_same_source_reports_fill_missing_correlation_fields() {
+        let aggregator = EventAggregator::new(Duration::from_secs(60));
+        let mut incomplete = earthquake("wolfx.jma_eew", "a", 1, 35.0);
+        incomplete.latitude = None;
+        incomplete.longitude = None;
+        incomplete.magnitude = None;
+        incomplete.occurred_at.clear();
+        let mut enriched = incomplete.clone();
+        enriched.latitude = Some(35.0);
+        enriched.longitude = Some(105.0);
+        enriched.magnitude = Some(5.2);
+        enriched.occurred_at = "2026-07-10 12:34:56".to_string();
+        let cross_source = earthquake("fanstudio.jma", "b", 1, 35.1);
+
+        let first = aggregator.correlate(&incomplete).await;
+        assert_eq!(first, aggregator.correlate(&enriched).await);
+        assert_eq!(first, aggregator.correlate(&cross_source).await);
     }
 }

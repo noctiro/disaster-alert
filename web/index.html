@@ -661,7 +661,7 @@
   <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js" integrity="sha256-20nQCchB9co0qIjJZRGuk2/Z9VM+kNiyxNV1lvTlZBo=" crossorigin="anonymous"></script>
   <script>
     const api = (window.DISASTER_API_BASE || window.location.origin).replace(/\/$/, "");
-    const storageKey = "disaster_subscription_draft_v1";
+    const storageKey = "disaster_subscription_draft_v2";
     const form = document.querySelector("#subscribe-form");
     const barkInput = document.querySelector("#bark-id");
     const barkUrlInput = document.querySelector("#bark-url");
@@ -1055,22 +1055,26 @@
           ids: [...new Set(selection.ids.filter((id) => typeof id === "string" && knownSources.has(id)))],
         };
       }
-      const finiteNumber = (value, defaultValue) => {
+      const numberInRange = (value, defaultValue, min, max, integer = false) => {
+        if ((typeof value !== "number" && typeof value !== "string")
+          || (typeof value === "string" && !value.trim())) return defaultValue;
         const number = Number(value);
-        return Number.isFinite(number) ? number : defaultValue;
+        return Number.isFinite(number) && number >= min && number <= max && (!integer || Number.isInteger(number))
+          ? number
+          : defaultValue;
       };
       if (category.id === "earthquake_warning") {
         fallback.estimated_intensity_bands = normalizeBands(candidate.estimated_intensity_bands)
           .map((band) => ({ min: band.min, max: band.max, interruption_level: band.level }));
       } else if (category.id === "earthquake_report") {
-        fallback.min_magnitude = finiteNumber(candidate.min_magnitude, fallback.min_magnitude);
+        fallback.min_magnitude = numberInRange(candidate.min_magnitude, fallback.min_magnitude, 0, 10);
       } else if (category.id === "weather_warning") {
-        fallback.min_severity = finiteNumber(candidate.min_severity, fallback.min_severity);
-        fallback.fallback_radius_km = finiteNumber(candidate.fallback_radius_km, fallback.fallback_radius_km);
+        fallback.min_severity = numberInRange(candidate.min_severity, fallback.min_severity, 1, 4, true);
+        fallback.fallback_radius_km = numberInRange(candidate.fallback_radius_km, fallback.fallback_radius_km, 1, 2000);
       } else if (category.id === "tsunami") {
-        fallback.min_severity = finiteNumber(candidate.min_severity, fallback.min_severity);
+        fallback.min_severity = numberInRange(candidate.min_severity, fallback.min_severity, 1, 4, true);
       } else if (category.id === "typhoon") {
-        fallback.max_center_distance_km = finiteNumber(candidate.max_center_distance_km, fallback.max_center_distance_km);
+        fallback.max_center_distance_km = numberInRange(candidate.max_center_distance_km, fallback.max_center_distance_km, 1, 3000);
       }
       return fallback;
     }
@@ -1150,7 +1154,13 @@
       alertRules = Object.fromEntries(optionCategories
         .filter((category) => configuredByCategory.has(category.id))
         .map((category) => [category.id, sanitizeAlertRule(category, configuredByCategory.get(category.id))]));
-      disabledAlertRules = {};
+      const disabled = Array.isArray(draft.disabled_alerts) ? draft.disabled_alerts : [];
+      const disabledByCategory = new Map(disabled
+        .filter((alert) => alert && typeof alert === "object" && typeof alert.category === "string")
+        .map((alert) => [alert.category, alert]));
+      disabledAlertRules = Object.fromEntries(optionCategories
+        .filter((category) => !alertRules[category.id] && disabledByCategory.has(category.id))
+        .map((category) => [category.id, sanitizeAlertRule(category, disabledByCategory.get(category.id))]));
       const earthquakeBands = alertRules.earthquake_warning?.estimated_intensity_bands;
       notifyBands = normalizeBands(earthquakeBands || defaultNotifyBands());
       renderNotifyBands();
@@ -1296,6 +1306,7 @@
           region: { province: location.province, city: location.city, district: location.district },
         })),
         alerts: Object.values(alertRules),
+        disabled_alerts: Object.values(disabledAlertRules),
       };
       localStorage.setItem(storageKey, JSON.stringify(draft));
     }
@@ -1513,7 +1524,17 @@
           const restored = disabledAlertRules[category] || option?.default_alert;
           if (restored) alertRules[category] = cloneJson(restored);
           delete disabledAlertRules[category];
+          if (category === "earthquake_warning" && alertRules[category]) {
+            notifyBands = normalizeBands(alertRules[category].estimated_intensity_bands);
+            syncNotifyBands();
+            renderNotifyBands();
+            setNotifyWarning("");
+          }
         } else {
+          if (category === "earthquake_warning" && !commitBands()) {
+            event.target.checked = true;
+            return;
+          }
           disabledAlertRules[category] = cloneJson(alertRules[category]);
           delete alertRules[category];
         }

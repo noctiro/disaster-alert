@@ -873,6 +873,12 @@
                 <span id="status-fanstudio-state" class="status-source-state">未知</span>
                 <span id="status-fanstudio-meta" class="status-source-meta">尚未获取数据</span>
               </div>
+              <div class="status-source">
+                <span id="status-huania-dot" class="dot"></span>
+                <span class="status-source-name">Huania</span>
+                <span id="status-huania-state" class="status-source-state">未知</span>
+                <span id="status-huania-meta" class="status-source-meta">尚未获取数据</span>
+              </div>
             </div>
             <div class="status-metrics">
               <div class="status-metric"><span>订阅总数</span><strong id="status-subscriptions">--</strong></div>
@@ -983,7 +989,7 @@
       </form>
     </section>
     <footer>
-      <p>数据来源：<a href="https://ws-api.wolfx.jp">Wolfx.jp</a> · <a href="https://api.fanstudio.tech/doc/ws-api/#home">FAN Studio</a>　开源项目：<a href="https://github.com/noctiro/disaster-alert">GitHub · noctiro/disaster-alert</a></p>
+      <p>数据来源：<a href="https://ws-api.wolfx.jp">Wolfx.jp</a> · <a href="https://api.fanstudio.tech/doc/ws-api/#home">FAN Studio</a> · <a href="https://mobile-new.chinaeew.cn/v1/">Huania</a>　开源项目：<a href="https://github.com/noctiro/disaster-alert">GitHub · noctiro/disaster-alert</a></p>
       <p>本服务仅用于灾害信息转发与个人提醒，数据可能延迟、缺失或误报，不构成官方预警或安全决策依据。请以所在地政府、应急管理部门及权威机构发布的信息为准，并遵从现场指引。</p>
     </footer>
   </main>
@@ -1038,6 +1044,9 @@
     const statusFanstudioDot = document.querySelector("#status-fanstudio-dot");
     const statusFanstudioState = document.querySelector("#status-fanstudio-state");
     const statusFanstudioMeta = document.querySelector("#status-fanstudio-meta");
+    const statusHuaniaDot = document.querySelector("#status-huania-dot");
+    const statusHuaniaState = document.querySelector("#status-huania-state");
+    const statusHuaniaMeta = document.querySelector("#status-huania-meta");
     const statusSubscriptions = document.querySelector("#status-subscriptions");
     const statusPending = document.querySelector("#status-pending");
     const statusDelivered = document.querySelector("#status-delivered");
@@ -2582,6 +2591,7 @@
       statusUpdated.textContent = "暂时无法获取";
       setStatusSource(statusWolfxDot, statusWolfxState, statusWolfxMeta, null);
       setStatusSource(statusFanstudioDot, statusFanstudioState, statusFanstudioMeta, null);
+      setStatusSource(statusHuaniaDot, statusHuaniaState, statusHuaniaMeta, null);
       statusSubscriptions.textContent = "--";
       statusPending.textContent = "--";
       statusDelivered.textContent = "--";
@@ -2613,12 +2623,13 @@
           return;
         }
 
-        const connectedSources = [data.wolfx, data.fanstudio]
+        const sources = [data.wolfx, data.fanstudio, data.huania];
+        const connectedSources = sources
           .filter((source) => source?.connected === true).length;
-        const sourceLabel = connectedSources === 2
+        const sourceLabel = connectedSources === sources.length
           ? "数据源正常"
-          : connectedSources === 1 ? "数据源 1/2" : "数据源离线";
-        const state = connectedSources === 2 ? "online" : connectedSources === 1 ? "partial" : "offline";
+          : connectedSources > 0 ? `数据源 ${connectedSources}/${sources.length}` : "数据源离线";
+        const state = connectedSources === sources.length ? "online" : connectedSources > 0 ? "partial" : "offline";
         const pending = data.durable && typeof data.durable === "object"
           ? Object.entries(data.durable)
             .filter(([key, value]) => key.endsWith("_pending") && Number.isFinite(value))
@@ -2630,14 +2641,15 @@
         );
         const wolfxNotifications = setStatusSource(statusWolfxDot, statusWolfxState, statusWolfxMeta, data.wolfx);
         const fanstudioNotifications = setStatusSource(statusFanstudioDot, statusFanstudioState, statusFanstudioMeta, data.fanstudio);
+        const huaniaNotifications = setStatusSource(statusHuaniaDot, statusHuaniaState, statusHuaniaMeta, data.huania);
         const durable = data.durable && typeof data.durable === "object" ? data.durable : {};
         const readyQueues = data.ready_queues && typeof data.ready_queues === "object" ? data.ready_queues : {};
         const readyQueueDepth = (name) => statusCount(readyQueues[name]?.depth);
         statusUpdated.textContent = `更新于 ${formatStatusTime(Date.now())}`;
         statusSubscriptions.textContent = formatStatusCount(data.total_subscriptions);
         statusPending.textContent = formatStatusCount(pending);
-        statusDelivered.textContent = formatStatusCount(wolfxNotifications.delivered + fanstudioNotifications.delivered);
-        statusFailed.textContent = formatStatusCount(wolfxNotifications.failed + fanstudioNotifications.failed);
+        statusDelivered.textContent = formatStatusCount(wolfxNotifications.delivered + fanstudioNotifications.delivered + huaniaNotifications.delivered);
+        statusFailed.textContent = formatStatusCount(wolfxNotifications.failed + fanstudioNotifications.failed + huaniaNotifications.failed);
         statusBacklog.textContent = `事件 ${formatStatusCount(durable.inbox_pending)} · 匹配 ${formatStatusCount(durable.match_jobs_pending)} · 投递 ${formatStatusCount(durable.delivery_batches_pending)} · 重试 ${formatStatusCount(durable.retries_pending)} · 订阅确认 ${formatStatusCount(durable.subscription_confirmations_pending)}；内存队列 事件 ${formatStatusCount(readyQueueDepth("inbox"))} · 匹配 ${formatStatusCount(readyQueueDepth("matching"))} · 投递 ${formatStatusCount(readyQueueDepth("delivery"))}`;
       } catch {
         setServiceStatus("状态未知");

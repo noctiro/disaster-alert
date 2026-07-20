@@ -671,6 +671,7 @@ mod tests {
         assert_eq!(value["total_subscriptions"], 12);
         assert!(value.get("wolfx").is_some());
         assert!(value.get("fanstudio").is_some());
+        assert!(value.get("huania").is_some());
         assert!(value.get("durable").is_some());
         assert!(value.get("ready_queues").is_some());
         assert!(value.get("runtime").is_none());

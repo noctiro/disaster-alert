@@ -6,7 +6,7 @@
 
 ## 功能
 
-- 接收 Wolfx 和 FAN Studio 提供的灾害信息
+- 接收 Wolfx、FAN Studio 和 Huania 提供的灾害信息
 - 支持地震预警、地震速报、气象预警、海啸预警和台风信息
 - 每个 Bark 订阅可以配置最多 3 个监测地点
 - 可按灾种、信息来源、预计烈度、震级、严重度和距离设置通知条件
@@ -211,4 +211,5 @@ cargo test --all-targets
 
 - 数据源：[wolfx.jp](https://ws-api.wolfx.jp)
 - 数据源：[FAN Studio](https://api.fanstudio.tech/doc/ws-api/#home)
+- 数据源：[成都高新减灾研究所](http://www.365icl.com/) / [成都市美幻科技有限公司](http://www.huania.com/)
 - 推送服务：[Bark](https://github.com/Finb/Bark)

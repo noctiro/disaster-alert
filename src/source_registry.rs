@@ -354,6 +354,16 @@ pub(crate) const SOURCES: &[SourceDefinition] = &[
         "中国气象局活跃台风",
         Some(8 * 3600)
     ),
+    source!(
+        "huania.earlywarning",
+        "earlywarning",
+        Huania,
+        EarthquakeWarning,
+        "huania-earthquake-warning",
+        "Huania 地震预警",
+        "Huania 地震预警",
+        None
+    ),
 ];
 
 pub(crate) fn find(id: &str) -> Option<&'static SourceDefinition> {

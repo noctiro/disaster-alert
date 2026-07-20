@@ -1,4 +1,4 @@
-use crate::providers::{FanStudioSource, WolfxSource};
+use crate::providers::{FanStudioSource, HuaniaSource, WolfxSource};
 use crate::runtime::EventRuntime;
 use crate::storage::Storage;
 use crate::subscriptions::SubscriptionConfirmationService;
@@ -16,6 +16,7 @@ pub(crate) struct RuntimeServices {
     subscription_confirmations: SubscriptionConfirmationService,
     wolfx: WolfxSource,
     fanstudio: FanStudioSource,
+    huania: HuaniaSource,
 }
 
 impl RuntimeServices {
@@ -25,6 +26,7 @@ impl RuntimeServices {
         subscription_confirmations: SubscriptionConfirmationService,
         wolfx: WolfxSource,
         fanstudio: FanStudioSource,
+        huania: HuaniaSource,
     ) -> Self {
         Self {
             storage,
@@ -32,6 +34,7 @@ impl RuntimeServices {
             subscription_confirmations,
             wolfx,
             fanstudio,
+            huania,
         }
     }
 }
@@ -47,6 +50,7 @@ enum TaskKind {
     SubscriptionConfirmations,
     Wolfx,
     FanStudio,
+    Huania,
 }
 
 struct ManagedTask {
@@ -96,6 +100,7 @@ struct ManagedTasks {
     subscription_confirmations: ManagedTask,
     wolfx: ManagedTask,
     fanstudio: ManagedTask,
+    huania: ManagedTask,
 }
 
 impl ManagedTasks {
@@ -105,6 +110,7 @@ impl ManagedTasks {
         subscription_confirmations: JoinHandle<TaskResult>,
         wolfx: JoinHandle<TaskResult>,
         fanstudio: JoinHandle<TaskResult>,
+        huania: JoinHandle<TaskResult>,
     ) -> Self {
         Self {
             server: ManagedTask::new(server),
@@ -112,6 +118,7 @@ impl ManagedTasks {
             subscription_confirmations: ManagedTask::new(subscription_confirmations),
             wolfx: ManagedTask::new(wolfx),
             fanstudio: ManagedTask::new(fanstudio),
+            huania: ManagedTask::new(huania),
         }
     }
 
@@ -122,6 +129,7 @@ impl ManagedTasks {
             TaskKind::SubscriptionConfirmations => self.subscription_confirmations.mark_completed(),
             TaskKind::Wolfx => self.wolfx.mark_completed(),
             TaskKind::FanStudio => self.fanstudio.mark_completed(),
+            TaskKind::Huania => self.huania.mark_completed(),
         }
     }
 
@@ -131,6 +139,7 @@ impl ManagedTasks {
             && self.subscription_confirmations.completed
             && self.wolfx.completed
             && self.fanstudio.completed
+            && self.huania.completed
     }
 
     fn ingress_completed(&self) -> bool {
@@ -138,6 +147,7 @@ impl ManagedTasks {
             && self.subscription_confirmations.completed
             && self.wolfx.completed
             && self.fanstudio.completed
+            && self.huania.completed
     }
 
     async fn abort_and_reap(&mut self) -> Result<()> {
@@ -147,12 +157,14 @@ impl ManagedTasks {
             confirmation_result,
             wolfx_result,
             fanstudio_result,
+            huania_result,
         ) = tokio::join!(
             self.server.abort_and_reap(),
             self.event_runtime.abort_and_reap(),
             self.subscription_confirmations.abort_and_reap(),
             self.wolfx.abort_and_reap(),
             self.fanstudio.abort_and_reap(),
+            self.huania.abort_and_reap(),
         );
         let mut errors = Vec::new();
         collect_task_result(server_result, &mut errors);
@@ -160,6 +172,7 @@ impl ManagedTasks {
         collect_task_result(confirmation_result, &mut errors);
         collect_task_result(wolfx_result, &mut errors);
         collect_task_result(fanstudio_result, &mut errors);
+        collect_task_result(huania_result, &mut errors);
         finish_task_results(errors)
     }
 }
@@ -229,6 +242,7 @@ pub(crate) async fn run_until_shutdown(
         subscription_confirmations,
         wolfx,
         fanstudio,
+        huania,
     } = services;
     let mut shutdown_signals = ShutdownSignals::new()?;
     let event_runtime_for_shutdown = event_runtime.clone();
@@ -267,12 +281,20 @@ pub(crate) async fn run_until_shutdown(
             .context("Wolfx provider failed")?;
         Ok("Wolfx provider")
     });
+    let fanstudio_shutdown = provider_shutdown_receiver.clone();
     let fanstudio_task = tokio::spawn(async move {
         fanstudio
-            .run(provider_shutdown_receiver)
+            .run(fanstudio_shutdown)
             .await
             .context("Fan Studio provider failed")?;
         Ok("Fan Studio provider")
+    });
+    let huania_task = tokio::spawn(async move {
+        huania
+            .run(provider_shutdown_receiver)
+            .await
+            .context("Huania provider failed")?;
+        Ok("Huania provider")
     });
     let mut tasks = ManagedTasks::new(
         server_task,
@@ -280,6 +302,7 @@ pub(crate) async fn run_until_shutdown(
         subscription_confirmation_task,
         wolfx_task,
         fanstudio_task,
+        huania_task,
     );
 
     let (run_result, completed_task) = tokio::select! {
@@ -303,6 +326,10 @@ pub(crate) async fn run_until_shutdown(
         result = &mut tasks.fanstudio.handle => (
             unexpected_task_completion(result),
             Some(TaskKind::FanStudio),
+        ),
+        result = &mut tasks.huania.handle => (
+            unexpected_task_completion(result),
+            Some(TaskKind::Huania),
         ),
     };
     if let Some(task) = completed_task {
@@ -377,6 +404,7 @@ async fn drain_ingress_tasks(
         let confirmations_pending = !tasks.subscription_confirmations.completed;
         let wolfx_pending = !tasks.wolfx.completed;
         let fanstudio_pending = !tasks.fanstudio.completed;
+        let huania_pending = !tasks.huania.completed;
         tokio::select! {
             result = &mut tasks.server.handle, if server_pending => {
                 tasks.server.collect_completion(result, &mut errors);
@@ -393,6 +421,9 @@ async fn drain_ingress_tasks(
             }
             result = &mut tasks.fanstudio.handle, if fanstudio_pending => {
                 tasks.fanstudio.collect_completion(result, &mut errors);
+            }
+            result = &mut tasks.huania.handle, if huania_pending => {
+                tasks.huania.collect_completion(result, &mut errors);
             }
             () = &mut deadline => {
                 tracing::warn!(event = "server.ingress_shutdown_timed_out", "server.ingress_shutdown_timed_out");
@@ -437,6 +468,7 @@ async fn drain_pipeline_tasks(
         let confirmations_pending = !tasks.subscription_confirmations.completed;
         let wolfx_pending = !tasks.wolfx.completed;
         let fanstudio_pending = !tasks.fanstudio.completed;
+        let huania_pending = !tasks.huania.completed;
         tokio::select! {
             result = &mut tasks.server.handle, if server_pending => {
                 tasks.server.collect_completion(result, &mut errors);
@@ -452,6 +484,9 @@ async fn drain_pipeline_tasks(
             }
             result = &mut tasks.fanstudio.handle, if fanstudio_pending => {
                 tasks.fanstudio.collect_completion(result, &mut errors);
+            }
+            result = &mut tasks.huania.handle, if huania_pending => {
+                tasks.huania.collect_completion(result, &mut errors);
             }
             () = &mut deadline => {
                 tracing::warn!(event = "server.pipeline_shutdown_timed_out", "server.pipeline_shutdown_timed_out");

@@ -8,6 +8,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 pub(crate) struct RuntimeStatus {
     wolfx: Arc<ChannelMetrics>,
     fanstudio: Arc<ChannelMetrics>,
+    huania: Arc<ChannelMetrics>,
     inbox_ready: Arc<ReadyQueueMetrics>,
     match_ready: Arc<ReadyQueueMetrics>,
     delivery_ready: Arc<ReadyQueueMetrics>,
@@ -28,6 +29,7 @@ pub(crate) struct ChannelMetrics {
 pub(crate) struct RuntimeStatusSnapshot {
     pub(crate) wolfx: ChannelSnapshot,
     pub(crate) fanstudio: ChannelSnapshot,
+    pub(crate) huania: ChannelSnapshot,
     pub(crate) durable: DurableBacklogSnapshot,
     pub(crate) ready_queues: ReadyQueuesSnapshot,
 }
@@ -78,6 +80,7 @@ impl RuntimeStatus {
         match channel {
             ProviderChannel::Wolfx => &self.wolfx,
             ProviderChannel::FanStudio => &self.fanstudio,
+            ProviderChannel::Huania => &self.huania,
         }
     }
 
@@ -89,10 +92,15 @@ impl RuntimeStatus {
         &self.fanstudio
     }
 
+    pub(crate) fn huania(&self) -> &ChannelMetrics {
+        &self.huania
+    }
+
     pub(crate) fn snapshot(&self, durable: DurableBacklogSnapshot) -> RuntimeStatusSnapshot {
         RuntimeStatusSnapshot {
             wolfx: self.wolfx.snapshot(),
             fanstudio: self.fanstudio.snapshot(),
+            huania: self.huania.snapshot(),
             durable,
             ready_queues: ReadyQueuesSnapshot {
                 inbox: self.inbox_ready.snapshot(),

@@ -260,6 +260,7 @@ use std::fmt;
 pub enum ProviderChannel {
     Wolfx,
     FanStudio,
+    Huania,
 }
 
 impl ProviderChannel {
@@ -267,6 +268,7 @@ impl ProviderChannel {
         match self {
             Self::Wolfx => "wolfx",
             Self::FanStudio => "fanstudio",
+            Self::Huania => "huania",
         }
     }
 }

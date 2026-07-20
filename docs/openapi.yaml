@@ -617,7 +617,7 @@ components:
     Status:
       type: object
       additionalProperties: false
-      required: [total_subscriptions, wolfx, fanstudio, durable, ready_queues]
+      required: [total_subscriptions, wolfx, fanstudio, huania, durable, ready_queues]
       properties:
         total_subscriptions:
           type: integer
@@ -625,6 +625,8 @@ components:
         wolfx:
           $ref: "#/components/schemas/ChannelStatus"
         fanstudio:
+          $ref: "#/components/schemas/ChannelStatus"
+        huania:
           $ref: "#/components/schemas/ChannelStatus"
         durable:
           $ref: "#/components/schemas/DurableBacklog"

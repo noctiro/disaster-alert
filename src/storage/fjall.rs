@@ -2030,6 +2030,7 @@ fn cursor_key(provider: ProviderChannel, stream: &str) -> Vec<u8> {
     key.push(match provider {
         ProviderChannel::Wolfx => 1,
         ProviderChannel::FanStudio => 2,
+        ProviderChannel::Huania => 3,
     });
     key.push(b':');
     key.extend_from_slice(stream.as_bytes());
